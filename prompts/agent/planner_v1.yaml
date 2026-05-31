@@ -1,0 +1,26 @@
+# Strategic Plan Generation Prompt v1
+version: "1.0"
+
+goal_extraction: "Extract the user's primary goal from their message"
+
+milestone_generation:
+  description: "Break the goal into 3-7 sequential milestones"
+  rules:
+    - "Each milestone should be a meaningful step the user can see progress on"
+    - "Identify dependencies between milestones"
+    - "Estimate how many conversation turns each milestone might take"
+    - "Make milestones user-visible by default"
+
+example_plans:
+  create_resume:
+    - "M1: Understand your education background"
+    - "M2: Determine your target role and industry"
+    - "M3: Mine your work and project experiences"
+    - "M4: Assemble resume draft"
+    - "M5: Review and optimize each section"
+    - "M6: Export final resume"
+  match_jd:
+    - "M1: Parse and understand the job description"
+    - "M2: Match JD requirements against your resume"
+    - "M3: Generate improvement suggestions"
+    - "M4: Apply selected improvements"

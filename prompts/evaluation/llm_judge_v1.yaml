@@ -1,0 +1,57 @@
+# LLM-as-Judge Evaluation Prompt v1
+version: "1.0"
+
+description: "Semantic quality evaluation of resume content across five dimensions"
+
+dimensions:
+  star_completeness:
+    weight: 0.35
+    description: "Do experience entries include Situation, Task, Action, and Result?"
+    scoring:
+      1-3: "Most entries describe only what was done (Action), missing context and results"
+      4-6: "Some entries have STAR elements but inconsistently applied"
+      7-8: "Most entries have 3+ STAR elements clearly present"
+      9-10: "Every entry has full STAR with specific details in each dimension"
+
+  quantitative_density:
+    weight: 0.30
+    description: "How many entries include specific numbers, percentages, or measurable outcomes?"
+    scoring:
+      1-3: "Almost no numbers or measurable outcomes"
+      4-6: "Some numbers present but vague (e.g. 'many', 'several')"
+      7-8: "Most entries have at least one specific metric"
+      9-10: "Every claim is backed by a specific number or percentage"
+
+  terminology_accuracy:
+    weight: 0.15
+    description: "Are technical terms spelled correctly and used appropriately?"
+    scoring:
+      1-3: "Major errors in tech stack naming or industry terminology"
+      4-6: "Minor inconsistencies in term usage"
+      7-8: "Terms are correct, occasionally missing context"
+      9-10: "All terms are precisely used with correct context"
+
+  conciseness:
+    weight: 0.10
+    description: "Is the writing tight and impactful? No filler words?"
+    scoring:
+      1-3: "Wordy, repetitive, or filled with meaningless phrases"
+      4-6: "Some filler but generally readable"
+      7-8: "Clean writing with few redundancies"
+      9-10: "Every word pulls its weight, maximum impact per sentence"
+
+  narrative_coherence:
+    weight: 0.10
+    description: "Does the resume tell a clear career story with logical progression?"
+    scoring:
+      1-3: "Disjointed experiences with no clear career narrative"
+      4-6: "Some progression visible but not clearly articulated"
+      7-8: "Clear career arc with logical progression between roles"
+      9-10: "Compelling narrative that positions each experience as a stepping stone"
+
+output_format:
+  - "Always include specific, actionable suggestions"
+  - "Cite specific examples from the resume text"
+  - "Be constructive — focus on what can be improved, not what's wrong"
+
+temperature: 0  # Must be deterministic for reproducible evaluations
