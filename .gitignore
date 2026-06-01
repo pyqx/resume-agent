@@ -16,9 +16,11 @@ out/
 
 # Data (runtime)
 data/sqlite.db
+data/sqlite.db-*
 data/chroma/
 data/cache/
 data/uploads/
+data/logs/
 
 # Environment
 .env

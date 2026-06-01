@@ -137,8 +137,13 @@ async def get_agent_loop() -> AgentLoop:
         ats_simulator = ATSSimulator()
         scorer = Scorer()
 
+        # Web tools
+        from agent.tools.web_tools import WebSearchTool, WebFetchTool
+
         registry.register_many([
             EchoTool(),
+            WebSearchTool(),
+            WebFetchTool(),
             SearchMemoryTool(store),
             GetUserProfileTool(store),
             GetUserPreferencesTool(store),
@@ -151,25 +156,19 @@ async def get_agent_loop() -> AgentLoop:
             RunFullQualityAuditTool(rule_evaluator, llm_judge, ats_simulator, scorer, get_current_resume),
         ])
 
-        # Resume version tools
-        from api.routes.resume import _version_manager, _save_resume
+        # Resume CRUD tools
+        from api.routes.resume import _save_resume
         from agent.tools.resume_tools import (
             ReadResumeSectionTool,
             UpdateResumeEntryTool,
             AddResumeEntryTool,
             DeleteResumeEntryTool,
-            ListResumeVersionsTool,
-            ForkResumeVersionTool,
-            DiffResumeVersionsTool,
         )
         registry.register_many([
             ReadResumeSectionTool(get_current_resume),
             UpdateResumeEntryTool(get_current_resume, _save_resume),
             AddResumeEntryTool(get_current_resume, _save_resume),
             DeleteResumeEntryTool(get_current_resume, _save_resume),
-            ListResumeVersionsTool(_version_manager),
-            ForkResumeVersionTool(_version_manager),
-            DiffResumeVersionsTool(_version_manager),
         ])
 
         # GitHub analysis tools

@@ -68,13 +68,17 @@ class LoopContext:
         })
 
     def tool_call_history_summary(self) -> str:
-        """Summarize all previous tool calls and their results for the LLM."""
+        """Summarize all previous tool calls and their FULL results for the LLM."""
         if not self.tool_call_history:
             return "No previous attempts."
         lines = []
         for entry in self.tool_call_history:
             status = "OK" if entry.get("success") else f"FAILED: {entry.get('error', 'unknown')}"
-            lines.append(f"- {entry['tool']}({json.dumps(entry.get('params', {}))}) → {status}")
+            data = entry.get("result_preview", "")
+            lines.append(f"Tool: {entry['tool']}")
+            lines.append(f"  Status: {status}")
+            if data:
+                lines.append(f"  Result: {data[:2000]}")
         return "\n".join(lines)
 
     def needs_user_input(self) -> bool:
@@ -220,7 +224,10 @@ Output ONLY valid JSON:"""
             # Build messages with conversation history for multi-turn context
             llm_messages: list[dict] = []
             for h in ctx.conversation_history[-20:]:  # last 20 turns max
-                llm_messages.append({"role": h.get("role", "user"), "content": h.get("content", "")})
+                role = h.get("role", "user")
+                if role == "agent":
+                    role = "assistant"
+                llm_messages.append({"role": role, "content": h.get("content", "")})
             llm_messages.append({"role": "user", "content": ctx.user_message})
 
             response = self._llm.messages.create(
@@ -285,11 +292,16 @@ Output ONLY valid JSON:"""
 
             result = await self._execute_tool_with_retry(tool_name, ctx, **params)
             ctx.tool_results.append(result)
+            data_preview = ""
+            if result.success and result.data:
+                raw = str(result.data)[:2000]
+                data_preview = raw
             ctx.tool_call_history.append({
                 "tool": tool_name,
                 "params": params,
                 "success": result.success,
                 "error": result.error_code if not result.success else None,
+                "result_preview": data_preview,
             })
 
             ctx.emit_event("tool_result", {
@@ -329,9 +341,12 @@ Output ONLY valid JSON:"""
         # Check if all tools succeeded
         all_success = all(r.success for r in ctx.tool_results)
         if not all_success:
+            # Only check the last N history entries matching current tool_results length
+            n = len(ctx.tool_results)
+            recent_history = ctx.tool_call_history[-n:] if n > 0 else []
             failed_tools = [
                 f"{h['tool']}: {h.get('error', 'unknown')}"
-                for h, r in zip(ctx.tool_call_history, ctx.tool_results)
+                for h, r in zip(recent_history, ctx.tool_results)
                 if not r.success
             ]
             ctx.emit_event("observe_decision", {

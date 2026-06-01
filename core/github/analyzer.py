@@ -82,6 +82,18 @@ class GitHubAnalyzer:
 
         return meta
 
+    async def full_analysis(self, repo_url: str) -> dict:
+        """Run all analysis stages and return combined results for suggestions."""
+        metadata = await self.stage1_metadata(repo_url)
+        structure = await self.stage2_structure(repo_url)
+        deep = await self.stage3_deep_analysis(repo_url)
+        return {
+            "metadata": metadata,
+            "structure": structure,
+            "dependencies": deep.get("dependencies", {}),
+            "issues": deep.get("issues", {}),
+        }
+
     async def stage2_structure(self, repo_url: str) -> dict:
         """Stage 2: Clone and analyze directory structure."""
         repo_path = None

@@ -67,7 +67,7 @@ class SelfIntroGenerator:
                 messages=[{
                     "role": "user",
                     "content": INTRO_PROMPT.format(
-                        resume_text=resume_text[:4000],
+                        resume_text=resume_text[:4000].replace("{", "{{").replace("}", "}}"),
                         language_preference=lang_pref,
                     ),
                 }],

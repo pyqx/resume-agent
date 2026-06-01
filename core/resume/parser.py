@@ -12,7 +12,7 @@ from core.llm import get_llm_client_from_settings
 from core.config import settings
 from core.resume.schema import (
     ResumeData, PersonalInfo, Education, WorkExperience,
-    ProjectExperience, Skill, EducationLevel,
+    ProjectExperience, Skill, EducationLevel, EDUCATION_LEVEL_CN_MAP,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,27 +141,29 @@ class ResumeParser:
         import fitz  # pymupdf
 
         doc = fitz.open(str(file_path))
-        warnings: list[str] = []
-        all_text: list[str] = []
+        try:
+            warnings: list[str] = []
+            all_text: list[str] = []
 
-        for page_num, page in enumerate(doc):
-            blocks = page.get_text("dict")["blocks"]
-            text_blocks = [b for b in blocks if b["type"] == 0]
-            if not text_blocks:
-                continue
+            for page_num, page in enumerate(doc):
+                blocks = page.get_text("dict")["blocks"]
+                text_blocks = [b for b in blocks if b["type"] == 0]
+                if not text_blocks:
+                    continue
 
-            x_centers = [(b["bbox"][0] + b["bbox"][2]) / 2 for b in text_blocks]
-            if self._is_dual_column(x_centers):
-                warnings.append(f"Page {page_num+1}: dual-column detected, linearized")
-                linearized = self._linearize_dual_column(text_blocks)
-                page_text = "\n".join(self._block_to_text(b) for b in linearized)
-            else:
-                page_text = page.get_text()
+                x_centers = [(b["bbox"][0] + b["bbox"][2]) / 2 for b in text_blocks]
+                if self._is_dual_column(x_centers):
+                    warnings.append(f"Page {page_num+1}: dual-column detected, linearized")
+                    linearized = self._linearize_dual_column(text_blocks)
+                    page_text = "\n".join(self._block_to_text(b) for b in linearized)
+                else:
+                    page_text = page.get_text()
 
-            all_text.append(page_text)
+                all_text.append(page_text)
 
-        doc.close()
-        raw_text = "\n\n".join(all_text)
+            raw_text = "\n\n".join(all_text)
+        finally:
+            doc.close()
 
         if not raw_text.strip():
             warnings.append("No text extracted from PDF")
@@ -184,15 +186,18 @@ class ResumeParser:
     def _ocr_pdf(self, file_path: Path) -> str:
         try:
             import fitz
+        except ImportError:
+            return ""
+
+        try:
             from PIL import Image
-            import io
+            import pytesseract
+        except ImportError:
+            return ""
+        import io
 
-            try:
-                import pytesseract
-            except ImportError:
-                return ""
-
-            doc = fitz.open(str(file_path))
+        doc = fitz.open(str(file_path))
+        try:
             all_text: list[str] = []
             for page in doc:
                 pix = page.get_pixmap(dpi=300)
@@ -200,10 +205,11 @@ class ResumeParser:
                 text = pytesseract.image_to_string(img, lang="chi_sim+eng")
                 if text.strip():
                     all_text.append(text)
-            doc.close()
             return "\n\n".join(all_text)
         except Exception:
             return ""
+        finally:
+            doc.close()
 
     def _parse_docx(self, file_path: Path) -> tuple[str, list[str]]:
         """Extract text from DOCX preserving paragraph styles and tables."""
@@ -430,7 +436,7 @@ class ResumeParser:
                     school=edu.get("school", ""),
                     degree=edu.get("degree", ""),
                     major=edu.get("major", ""),
-                    level=self._safe_enum(EducationLevel, edu.get("level"), "other"),
+                    level=self._safe_enum(EducationLevel, edu.get("level"), "other", EDUCATION_LEVEL_CN_MAP),
                     start_date=self._parse_date(edu.get("start_date")),
                     end_date=self._parse_date(edu.get("end_date")),
                     gpa=edu.get("gpa", ""),
@@ -491,13 +497,15 @@ class ResumeParser:
         return resume
 
     @staticmethod
-    def _safe_enum(enum_cls, value, default):
+    def _safe_enum(enum_cls, value, default, cn_map=None):
         """Safely convert a value to an enum member, with Chinese→English mapping."""
         if not value:
             return enum_cls(default)
         # Try Chinese→English mapping first
-        cn_map = getattr(enum_cls, "CN_MAP", {})
-        mapped = cn_map.get(str(value).strip(), value)
+        if cn_map:
+            mapped = cn_map.get(str(value).strip(), value)
+        else:
+            mapped = value
         try:
             return enum_cls(mapped)
         except ValueError:

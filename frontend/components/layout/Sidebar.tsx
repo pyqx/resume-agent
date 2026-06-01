@@ -7,8 +7,6 @@ import { useResumeContext } from "@/contexts/ResumeContext";
 
 const NAV_ITEMS = [
   { href: "/", label: "首页", icon: "🏠" },
-  { href: "/resume", label: "简历编辑", icon: "📄" },
-  { href: "/resume/versions", label: "版本管理", icon: "🔀" },
   { href: "/match", label: "JD匹配", icon: "🎯" },
   { href: "/interview", label: "面试准备", icon: "💬" },
 ];
@@ -21,6 +19,7 @@ export default function Sidebar() {
   const fetchSessions = async () => {
     try {
       const res = await fetch("/api/sessions/");
+      if (!res.ok) return;
       const data = await res.json();
       setSessions(data.sessions || []);
     } catch {}

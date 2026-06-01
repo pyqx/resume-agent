@@ -80,7 +80,7 @@ class ReadResumeSectionTool(BaseTool):
 
             return ToolResult.ok(sections[section])
         except Exception as e:
-            return ToolResult.fail("READ_ERROR", str(e))
+            return ToolResult.fail("READ_ERROR", str(e), is_retryable=True)
 
 
 class UpdateResumeEntryTool(BaseTool):
@@ -121,7 +121,7 @@ class UpdateResumeEntryTool(BaseTool):
             self._save_resume(resume)
             return ToolResult.ok({"entry_id": entry_id, "updated": list(updates.keys())})
         except Exception as e:
-            return ToolResult.fail("UPDATE_ERROR", str(e))
+            return ToolResult.fail("UPDATE_ERROR", str(e), is_retryable=True)
 
 
 class AddResumeEntryTool(BaseTool):
@@ -174,7 +174,7 @@ class AddResumeEntryTool(BaseTool):
             self._save_resume(resume)
             return ToolResult.ok({"entry_id": entry.id, "section": section})
         except Exception as e:
-            return ToolResult.fail("ADD_ERROR", str(e))
+            return ToolResult.fail("ADD_ERROR", str(e), is_retryable=True)
 
 
 class DeleteResumeEntryTool(BaseTool):
@@ -210,7 +210,7 @@ class DeleteResumeEntryTool(BaseTool):
             self._save_resume(resume)
             return ToolResult.ok({"deleted": entry_id})
         except Exception as e:
-            return ToolResult.fail("DELETE_ERROR", str(e))
+            return ToolResult.fail("DELETE_ERROR", str(e), is_retryable=True)
 
 
 class ListResumeVersionsTool(BaseTool):
@@ -232,7 +232,7 @@ class ListResumeVersionsTool(BaseTool):
             versions = self._vm.list_versions()
             return ToolResult.ok(versions)
         except Exception as e:
-            return ToolResult.fail("VERSION_ERROR", str(e))
+            return ToolResult.fail("VERSION_ERROR", str(e), is_retryable=True)
 
 
 class ForkResumeVersionTool(BaseTool):
@@ -260,7 +260,7 @@ class ForkResumeVersionTool(BaseTool):
         except KeyError:
             return ToolResult.fail("NOT_FOUND", f"Version {source_version_id} not found")
         except Exception as e:
-            return ToolResult.fail("FORK_ERROR", str(e))
+            return ToolResult.fail("FORK_ERROR", str(e), is_retryable=True)
 
 
 class DiffResumeVersionsTool(BaseTool):
@@ -292,4 +292,4 @@ class DiffResumeVersionsTool(BaseTool):
         except KeyError as e:
             return ToolResult.fail("NOT_FOUND", str(e))
         except Exception as e:
-            return ToolResult.fail("DIFF_ERROR", str(e))
+            return ToolResult.fail("DIFF_ERROR", str(e), is_retryable=True)

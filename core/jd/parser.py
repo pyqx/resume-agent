@@ -60,7 +60,9 @@ class JDParser:
                 temperature=0.0,
                 messages=[{
                     "role": "user",
-                    "content": JD_EXTRACTION_PROMPT.format(jd_text=jd_text[:8000]),
+                    "content": JD_EXTRACTION_PROMPT.format(
+                        jd_text=jd_text[:8000].replace("{", "{{").replace("}", "}}")
+                    ),
                 }],
             )
 

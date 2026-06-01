@@ -121,9 +121,9 @@ class JDMatcher:
                 messages=[{
                     "role": "user",
                     "content": MATCH_PROMPT.format(
-                        requirement=req.criterion,
+                        requirement=req.criterion.replace("{", "{{").replace("}", "}}"),
                         req_type=req.type.value,
-                        resume_chunks=chunks[:4000],
+                        resume_chunks=chunks[:4000].replace("{", "{{").replace("}", "}}"),
                     ),
                 }],
             )

@@ -66,7 +66,9 @@ class LLMJudge:
                 temperature=0.0,
                 messages=[{
                     "role": "user",
-                    "content": JUDGE_PROMPT.format(resume_text=resume_text[:8000]),
+                    "content": JUDGE_PROMPT.format(
+                    resume_text=resume_text[:8000].replace("{", "{{").replace("}", "}}")
+                ),
                 }],
             )
 

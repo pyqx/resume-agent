@@ -146,7 +146,7 @@ export default function Home() {
     const sessionParam = searchParams.get("session");
     if (sessionParam && sessionParam !== sessionId) {
       fetch(`/api/sessions/${sessionParam}`)
-        .then((r) => r.json())
+        .then((r) => { if (!r.ok) throw new Error("Session not found"); return r.json(); })
         .then((data) => {
           if (data.messages) {
             setMessages(data.messages.map((m: { role: string; content: string; created_at: string }) => ({

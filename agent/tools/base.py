@@ -13,6 +13,7 @@ class ToolCategory(Enum):
     QUALITY = "quality"
     MEMORY = "memory"
     INTERVIEW = "interview"
+    WEB = "web"
     UTILITY = "utility"
 
 

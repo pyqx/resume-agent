@@ -71,8 +71,8 @@ class WeaknessStrategist:
                 messages=[{
                     "role": "user",
                     "content": WEAKNESS_PROMPT.format(
-                        resume_text=resume_text[:4000],
-                        detected_concerns="\n".join(f"- {c}" for c in concerns),
+                        resume_text=resume_text[:4000].replace("{", "{{").replace("}", "}}"),
+                        detected_concerns="\n".join(f"- {c}" for c in concerns).replace("{", "{{").replace("}", "}}"),
                     ),
                 }],
             )

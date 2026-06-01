@@ -16,14 +16,16 @@ class FetchRepoMetadataTool(BaseTool):
         return ToolMetadata(
             name="fetch_repo_metadata",
             category=ToolCategory.GITHUB,
-            description="Stage 1: Fetch basic metadata (stars, language, description) for a GitHub repo",
-            usage_guide="Use first when a user provides a GitHub URL. Quick overview before deciding to do deeper analysis.",
+            description="Fetch basic metadata (stars, language, description) for a GitHub repo",
+            usage_guide="Use when the user provides a GitHub URL. Returns stars, language, description, topics.",
             preconditions=["github_url_provided"],
             estimated_time=Difficulty.LIGHT,
             is_idempotent=True,
         )
 
     async def execute(self, repo_url: str = "", **kwargs) -> ToolResult:
+        if not repo_url:
+            repo_url = kwargs.get("github_url", "")
         if not repo_url:
             return ToolResult.fail("PARAM_ERROR", "repo_url is required")
         try:
@@ -43,14 +45,16 @@ class AnalyzeRepoStructureTool(BaseTool):
         return ToolMetadata(
             name="analyze_repo_structure",
             category=ToolCategory.GITHUB,
-            description="Stage 2: Clone repo and analyze directory structure, modules, and tech stack",
-            usage_guide="Use after metadata looks promising. Provides module map and tech stack details.",
+            description="Clone repo and analyze directory structure, modules, and tech stack",
+            usage_guide="Provides module map, tech stack, and directory structure of the repo.",
             preconditions=["github_url_provided"],
             estimated_time=Difficulty.MEDIUM,
             is_idempotent=True,
         )
 
     async def execute(self, repo_url: str = "", **kwargs) -> ToolResult:
+        if not repo_url:
+            repo_url = kwargs.get("github_url", "")
         if not repo_url:
             return ToolResult.fail("PARAM_ERROR", "repo_url is required")
         try:
@@ -79,6 +83,8 @@ class AnalyzeRepoDependenciesTool(BaseTool):
 
     async def execute(self, repo_url: str = "", **kwargs) -> ToolResult:
         if not repo_url:
+            repo_url = kwargs.get("github_url", "")
+        if not repo_url:
             return ToolResult.fail("PARAM_ERROR", "repo_url is required")
         try:
             results = await self._analyzer.stage3_deep_analysis(repo_url)
@@ -104,6 +110,8 @@ class ScanIssuesForOpportunitiesTool(BaseTool):
         )
 
     async def execute(self, repo_url: str = "", **kwargs) -> ToolResult:
+        if not repo_url:
+            repo_url = kwargs.get("github_url", "")
         if not repo_url:
             return ToolResult.fail("PARAM_ERROR", "repo_url is required")
         try:
@@ -132,9 +140,15 @@ class GenerateDevSuggestionsTool(BaseTool):
 
     async def execute(self, repo_url: str = "", repo_analysis: dict | None = None, **kwargs) -> ToolResult:
         if not repo_url:
+            repo_url = kwargs.get("github_url", "")
+        if not repo_url:
             return ToolResult.fail("PARAM_ERROR", "repo_url is required")
         try:
-            analysis = repo_analysis or {}
+            # Auto-fetch repo analysis if not provided (stages 2+3)
+            if not repo_analysis:
+                logger.info("Auto-running analysis stages for suggestions: %s", repo_url)
+                repo_analysis = await self._analyzer.full_analysis(repo_url)
+
             career = ""
             try:
                 profile = self._get_profile()
@@ -143,7 +157,7 @@ class GenerateDevSuggestionsTool(BaseTool):
                 pass
 
             result = await self._analyzer.stage4_suggestions(
-                repo_analysis=analysis,
+                repo_analysis=repo_analysis,
                 career_direction=career or "general software development",
             )
             return ToolResult.ok(result)
@@ -177,4 +191,4 @@ class ComposeResumeEntryFromGitHubTool(BaseTool):
             )
             return ToolResult.ok(result)
         except Exception as e:
-            return ToolResult.fail("COMPOSE_ERROR", str(e))
+            return ToolResult.fail("COMPOSE_ERROR", str(e), is_retryable=True)

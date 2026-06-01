@@ -64,7 +64,7 @@ class GenerateSelfIntroTool(BaseTool):
             result = await self._generator.generate(resume)
             return ToolResult.ok(result)
         except Exception as e:
-            return ToolResult.fail("INTRO_ERROR", str(e))
+            return ToolResult.fail("INTRO_ERROR", str(e), is_retryable=True)
 
 
 class AnalyzeResumeWeaknessesTool(BaseTool):
@@ -92,4 +92,4 @@ class AnalyzeResumeWeaknessesTool(BaseTool):
             result = await self._strategist.analyze(resume)
             return ToolResult.ok(result)
         except Exception as e:
-            return ToolResult.fail("WEAKNESS_ERROR", str(e))
+            return ToolResult.fail("WEAKNESS_ERROR", str(e), is_retryable=True)

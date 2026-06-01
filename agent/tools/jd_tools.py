@@ -100,7 +100,7 @@ class AnalyzeKeywordCoverageTool(BaseTool):
                 "missing_keywords": missing[:50],
             })
         except Exception as e:
-            return ToolResult.fail("KEYWORD_ERROR", str(e))
+            return ToolResult.fail("KEYWORD_ERROR", str(e), is_retryable=True)
 
 
 class DetectJDSignalsTool(BaseTool):
@@ -124,4 +124,4 @@ class DetectJDSignalsTool(BaseTool):
             signals = self._detector.detect(jd_text)
             return ToolResult.ok([s.model_dump(mode="json") for s in signals])
         except Exception as e:
-            return ToolResult.fail("SIGNAL_ERROR", str(e))
+            return ToolResult.fail("SIGNAL_ERROR", str(e), is_retryable=True)

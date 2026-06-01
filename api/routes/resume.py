@@ -271,112 +271,26 @@ async def delete_resume_entry(resume_id: str, entry_id: str):
     return {"deleted": entry_id}
 
 
-# ── Version Management ─────────────────────────────────────
+@router.delete("/{resume_id}")
+async def delete_resume(resume_id: str):
+    """Delete a resume from memory and disk."""
+    global _current_resume_id
+    if resume_id not in _resume_store:
+        raise HTTPException(status_code=404, detail="Resume not found")
 
-from core.resume.version_manager import VersionManager
+    del _resume_store[resume_id]
 
-_version_manager = VersionManager()
+    # Clear current reference if it matches
+    if _current_resume_id == resume_id:
+        _current_resume_id = ""
 
+    # Delete persisted JSON
+    file_path = settings.uploads_path / f"{resume_id}.json"
+    if file_path.exists():
+        file_path.unlink()
 
-def _sync_store_to_versions():
-    """Sync the in-memory _resume_store to VersionManager versions.
-    Called after a resume is parsed/uploaded to create an initial version.
-    """
-    for resume_id, resume in _resume_store.items():
-        existing = [v for v in _version_manager.list_versions()
-                    if v["id"] == resume_id]
-        if not existing:
-            _version_manager.create_version(
-                resume_data=resume,
-                name="Initial Import",
-                notes="Created from uploaded resume",
-            )
-
-
-@router.post("/versions")
-async def create_version(request: Request):
-    """Create a new version or fork from an existing one."""
-    body = await request.json()
-    action = body.get("action", "create")
-    name = body.get("name", "Untitled")
-    notes = body.get("notes", "")
-    parent_id = body.get("parent_id")
-    resume_id = body.get("resume_id")
-
-    if action == "fork":
-        if not parent_id:
-            raise HTTPException(status_code=400, detail="parent_id required for fork")
-        try:
-            version = _version_manager.fork_version(parent_id, name, notes)
-        except KeyError:
-            raise HTTPException(status_code=404, detail=f"Parent version {parent_id} not found")
-    else:
-        resume = _get_resume(resume_id) if resume_id else None
-        if not resume:
-            raise HTTPException(status_code=404, detail="Resume not found")
-        version = _version_manager.create_version(resume, name, notes)
-
-    return {
-        "version_id": version.id,
-        "name": version.name,
-        "created_at": str(version.created_at),
-    }
-
-
-@router.get("/versions")
-async def list_versions():
-    """List all resume versions."""
-    return {"versions": _version_manager.list_versions()}
-
-
-@router.get("/versions/{version_id}")
-async def get_version(version_id: str):
-    """Get a specific version's full resume data."""
-    try:
-        version = _version_manager.get_version(version_id)
-        return {
-            "version": {
-                "id": version.id,
-                "parent_id": version.parent_id,
-                "name": version.name,
-                "notes": version.notes,
-                "created_at": str(version.created_at),
-                "updated_at": str(version.updated_at),
-            },
-            "resume": version.resume_data.model_dump(mode="json"),
-        }
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Version not found")
-
-
-@router.get("/versions/{version_id}/diff")
-async def diff_versions(version_id: str, against: str = ""):
-    """Get the diff between two versions."""
-    if not against:
-        # Diff against parent by default
-        try:
-            v = _version_manager.get_version(version_id)
-            if v.parent_id:
-                against = v.parent_id
-            else:
-                raise HTTPException(status_code=400, detail="No parent to diff against. Specify 'against' query param.")
-        except KeyError:
-            raise HTTPException(status_code=404, detail="Version not found")
-
-    try:
-        diff = _version_manager.diff_versions(against, version_id)
-        return diff.model_dump(mode="json")
-    except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-
-@router.delete("/versions/{version_id}")
-async def delete_version(version_id: str):
-    """Delete a version."""
-    deleted = _version_manager.delete_version(version_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Version not found")
-    return {"deleted": version_id}
+    logger.info("Resume deleted: id=%s", resume_id)
+    return {"deleted": resume_id}
 
 
 # Load persisted resumes on module import

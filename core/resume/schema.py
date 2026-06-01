@@ -16,20 +16,21 @@ class EducationLevel(str, Enum):
     PHD = "phd"
     OTHER = "other"
 
-    # Chinese-to-English mapping for LLM compatibility
-    CN_MAP: dict[str, str] = {
-        "高中": "high_school",
-        "中专": "high_school",
-        "大专": "associate",
-        "专科": "associate",
-        "本科": "bachelor",
-        "学士": "bachelor",
-        "硕士": "master",
-        "研究生": "master",
-        "博士": "phd",
-        "博士学位": "phd",
-        "其他": "other",
-    }
+
+# Chinese-to-English education level mapping for LLM compatibility
+EDUCATION_LEVEL_CN_MAP: dict[str, str] = {
+    "高中": "high_school",
+    "中专": "high_school",
+    "大专": "associate",
+    "专科": "associate",
+    "本科": "bachelor",
+    "学士": "bachelor",
+    "硕士": "master",
+    "研究生": "master",
+    "博士": "phd",
+    "博士学位": "phd",
+    "其他": "other",
+}
 
 
 class EntryType(str, Enum):

@@ -64,7 +64,7 @@ class EvaluateStarCompletenessTool(BaseTool):
 
             return ToolResult.ok(results)
         except Exception as e:
-            return ToolResult.fail("STAR_EVAL_ERROR", str(e))
+            return ToolResult.fail("STAR_EVAL_ERROR", str(e), is_retryable=True)
 
 
 class EvaluateEntryQualityTool(BaseTool):
@@ -103,7 +103,7 @@ class EvaluateEntryQualityTool(BaseTool):
                 "evaluation": result,
             })
         except Exception as e:
-            return ToolResult.fail("QUALITY_ERROR", str(e))
+            return ToolResult.fail("QUALITY_ERROR", str(e), is_retryable=True)
 
 
 class CheckVerbStrengthTool(BaseTool):
@@ -141,7 +141,7 @@ class CheckVerbStrengthTool(BaseTool):
                 ],
             })
         except Exception as e:
-            return ToolResult.fail("VERB_CHECK_ERROR", str(e))
+            return ToolResult.fail("VERB_CHECK_ERROR", str(e), is_retryable=True)
 
 
 class CheckSensitiveInfoTool(BaseTool):
@@ -179,7 +179,7 @@ class CheckSensitiveInfoTool(BaseTool):
                 ],
             })
         except Exception as e:
-            return ToolResult.fail("SENSITIVE_CHECK_ERROR", str(e))
+            return ToolResult.fail("SENSITIVE_CHECK_ERROR", str(e), is_retryable=True)
 
 
 class RunFullQualityAuditTool(BaseTool):

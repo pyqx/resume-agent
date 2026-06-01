@@ -101,14 +101,17 @@ class ContextAssembler:
             "No resume loaded. Ask the user to upload one if needed."
         )
 
-        # Assemble system prompt
+        # Assemble system prompt (escape curly braces from user content)
+        def _escape(v: str) -> str:
+            return v.replace("{", "{{").replace("}", "}}") if isinstance(v, str) else v
+
         system_prompt = SYSTEM_PROMPT.format(
-            user_profile=user_profile,
-            preferences=preferences,
-            session_context=session_ctx,
-            feedback_history=feedback,
-            resume_context=resume_context,
-            tool_manifest=tool_manifest_text,
+            user_profile=_escape(user_profile),
+            preferences=_escape(preferences),
+            session_context=_escape(session_ctx),
+            feedback_history=_escape(feedback),
+            resume_context=_escape(resume_context),
+            tool_manifest=_escape(tool_manifest_text),
         )
 
         return {

@@ -61,7 +61,9 @@ class MemoryExtractor:
                 temperature=0.0,
                 messages=[{
                     "role": "user",
-                    "content": EXTRACTION_PROMPT.format(conversation=conversation),
+                    "content": EXTRACTION_PROMPT.format(
+                        conversation=conversation.replace("{", "{{").replace("}", "}}")
+                    ),
                 }],
             )
 

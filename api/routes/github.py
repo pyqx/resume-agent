@@ -1,5 +1,6 @@
 """GitHub analysis API routes — progressive disclosure streaming."""
 
+import json
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
@@ -29,17 +30,17 @@ async def analyze_github_repo(request: Request):
         # Stage 1: Metadata
         yield {"event": "stage", "data": '{"stage": 1, "name": "metadata"}'}
         meta = await analyzer.stage1_metadata(repo_url)
-        yield {"event": "metadata", "data": str(meta).lower()}
+        yield {"event": "metadata", "data": json.dumps(meta)}
 
         # Stage 2: Structure
         yield {"event": "stage", "data": '{"stage": 2, "name": "structure"}'}
         structure = await analyzer.stage2_structure(repo_url)
-        yield {"event": "structure", "data": str(structure)[:5000]}
+        yield {"event": "structure", "data": json.dumps(structure)[:5000]}
 
         # Stage 3: Deep analysis
         yield {"event": "stage", "data": '{"stage": 3, "name": "deep_analysis"}'}
         deep = await analyzer.stage3_deep_analysis(repo_url)
-        yield {"event": "deep_analysis", "data": str(deep)[:5000]}
+        yield {"event": "deep_analysis", "data": json.dumps(deep)[:5000]}
 
         # Combine all analysis for stage 4
         full_analysis = {
@@ -52,7 +53,7 @@ async def analyze_github_repo(request: Request):
         # Stage 4: Suggestions
         yield {"event": "stage", "data": '{"stage": 4, "name": "suggestions"}'}
         suggestions = await analyzer.stage4_suggestions(full_analysis)
-        yield {"event": "suggestions", "data": str(suggestions)[:8000]}
+        yield {"event": "suggestions", "data": json.dumps(suggestions)[:8000]}
 
         # Stage 5: ready for resume entry composition (on-demand)
         yield {"event": "stage", "data": '{"stage": 5, "name": "ready"}'}

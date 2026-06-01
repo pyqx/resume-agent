@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 
 from fastapi import APIRouter, Depends, Request
 from sse_starlette.sse import EventSourceResponse
@@ -57,6 +58,22 @@ def _build_resume_summary(resume) -> str:
     return "\n".join(lines)
 
 
+_GITHUB_RE = re.compile(r'https?://github\.com/[\w.-]+/[\w.-]+')
+
+
+def _detect_github_urls(body: dict, ws: dict) -> dict:
+    """Extract GitHub URLs from the message body and set in working_state."""
+    message = body.get("message", "")
+    if not message:
+        return ws
+    match = _GITHUB_RE.search(message)
+    if match:
+        ws["github_url"] = match.group().rstrip("/")
+        ws["github_url_provided"] = True
+        logger.info("GitHub URL detected: %s", ws["github_url"])
+    return ws
+
+
 def _enrich_working_state(working_state: dict | None, body: dict) -> dict:
     """Load resume data into working_state if resume_id is provided."""
     import api.routes.resume as resume_mod
@@ -95,6 +112,7 @@ async def chat_stream(
     session_id = body.get("session_id")
     user_id = body.get("user_id", "default")
     working_state = _enrich_working_state(body.get("working_state"), body)
+    working_state = _detect_github_urls(body, working_state)
 
     if not message:
         return EventSourceResponse(_error_stream("message is required"))
@@ -176,6 +194,7 @@ async def chat_send(
     session_id = body.get("session_id")
     user_id = body.get("user_id", "default")
     working_state = _enrich_working_state(body.get("working_state"), body)
+    working_state = _detect_github_urls(body, working_state)
 
     if not message:
         return {"error": "message is required"}
@@ -185,11 +204,24 @@ async def chat_send(
     from api.session_manager import SessionManager
     db = await get_db()
     sm = SessionManager(db)
+    history_messages = []
     if not session_id:
         session_id = await sm.create_session(
             user_id=user_id,
             resume_id=body.get("resume_id", ""),
         )
+    else:
+        history_messages = await sm.get_messages(session_id)
+        sessions_list = await sm.list_sessions(user_id=user_id)
+        for s in sessions_list:
+            if s["id"] == session_id and s.get("resume_id"):
+                if not body.get("resume_id") and s["resume_id"]:
+                    working_state = _enrich_working_state(
+                        working_state,
+                        {"resume_id": s["resume_id"]},
+                    )
+                break
+
     await sm.save_message(session_id, "user", message)
     title = message[:50] + ("..." if len(message) > 50 else "")
     await sm.update_title(session_id, title)
@@ -201,6 +233,7 @@ async def chat_send(
         session_id=session_id,
         user_id=user_id,
         working_state=working_state,
+        history=history_messages,
     ):
         responses.append(event)
         if event["type"] == "final":

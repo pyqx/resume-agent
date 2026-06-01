@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 QUESTIONS_PROMPT = """You are an experienced technical interviewer. Generate interview questions based on the candidate's resume and job description.
 
+{language_instruction}
+
 ## Resume
 {resume_text}
 
@@ -61,14 +63,35 @@ class InterviewQuestionGenerator:
             self._llm = get_llm_client_from_settings()
         return self._llm
 
+    @staticmethod
+    def _detect_language(resume: ResumeData) -> str:
+        """Detect if resume is Chinese or English based on content."""
+        texts = []
+        for w in resume.work_experience:
+            texts.extend(w.bullets)
+            texts.append(w.company)
+            texts.append(w.position)
+        all_text = " ".join(t for t in texts if t)
+        cjk_chars = sum(1 for c in all_text if '一' <= c <= '鿿')
+        return "chinese" if cjk_chars > 10 else "english"
+
     async def generate(
         self,
         resume: ResumeData,
         jd: JDRequirements | None = None,
     ) -> dict:
-        """Generate comprehensive interview questions."""
+        """Generate comprehensive interview questions, matching resume language."""
         resume_text = self._resume_to_text(resume)
         jd_text = jd.raw_text if jd else "No job description provided."
+        lang = self._detect_language(resume)
+
+        lang_instruction = (
+            "IMPORTANT: The resume is in Chinese. Generate ALL questions and tips in Chinese (Simplified). "
+            "Questions should reflect what Chinese domestic companies (互联网大厂/国企/外企 in China) typically ask "
+            "for this position, in Chinese language."
+            if lang == "chinese"
+            else "Generate ALL questions in English."
+        )
 
         try:
             response = self.llm.messages.create(
@@ -78,8 +101,9 @@ class InterviewQuestionGenerator:
                 messages=[{
                     "role": "user",
                     "content": QUESTIONS_PROMPT.format(
-                        resume_text=resume_text[:5000],
-                        jd_text=jd_text[:3000],
+                        language_instruction=lang_instruction,
+                        resume_text=resume_text[:5000].replace("{", "{{").replace("}", "}}"),
+                        jd_text=jd_text[:3000].replace("{", "{{").replace("}", "}}"),
                     ),
                 }],
             )
