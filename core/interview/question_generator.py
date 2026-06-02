@@ -71,9 +71,19 @@ class InterviewQuestionGenerator:
             texts.extend(w.bullets)
             texts.append(w.company)
             texts.append(w.position)
+        for p in resume.project_experience:
+            texts.extend(p.bullets)
+            texts.append(p.name)
+        for e in resume.education:
+            texts.append(e.school)
+            texts.append(e.major)
+        if resume.skills:
+            texts.extend(s.name for s in resume.skills)
+        if resume.personal_info.summary:
+            texts.append(resume.personal_info.summary)
         all_text = " ".join(t for t in texts if t)
         cjk_chars = sum(1 for c in all_text if '一' <= c <= '鿿')
-        return "chinese" if cjk_chars > 10 else "english"
+        return "chinese" if cjk_chars >= 5 else "english"
 
     async def generate(
         self,

@@ -71,13 +71,17 @@ class JDMatcher:
 
         # Combine all requirements
         all_requirements = list(jd.hard_requirements) + list(jd.nice_to_have)
+        logger.info("Matcher: total requirements=%d (hard=%d, plus=%d)",
+                    len(all_requirements), len(jd.hard_requirements), len(jd.nice_to_have))
 
         # Stage 1: Build resume text chunks for each section
         resume_chunks = self._build_resume_chunks(resume)
+        logger.info("Matcher: resume chunks length=%d chars", len(resume_chunks))
 
         # Stage 2: LLM rerank for each requirement (parallelized in batches)
         scored_requirements = []
         for req in all_requirements:
+            logger.debug("Scoring requirement: %s (%s)", req.criterion, req.type.value)
             scored_req = await self._score_requirement(req, resume_chunks)
             scored_requirements.append(scored_req)
 
@@ -88,9 +92,13 @@ class JDMatcher:
         must_have_met = sum(1 for r in must_have if r.match_level == MatchLevel.FULL)
         plus_met = sum(1 for r in plus if r.match_level == MatchLevel.FULL)
 
-        must_have_score = must_have_met / len(must_have) if must_have else 1.0
-        plus_score = plus_met / len(plus) if plus else 1.0
-        overall = round((must_have_score * 0.7 + plus_score * 0.3) * 100, 1)
+        # If no requirements were parsed, score is 0 (not 100)
+        if not all_requirements:
+            overall = 0.0
+        else:
+            must_have_score = must_have_met / len(must_have) if must_have else 0.0
+            plus_score = plus_met / len(plus) if plus else 0.0
+            overall = round((must_have_score * 0.7 + plus_score * 0.3) * 100, 1)
 
         report = MatchReport(
             resume_id=resume.id,
@@ -205,4 +213,8 @@ class JDMatcher:
         if text.startswith("```"):
             lines = text.split("\n")
             text = "\n".join(lines[1:-1])
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start:end + 1]
         return text

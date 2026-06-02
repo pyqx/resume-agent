@@ -14,14 +14,7 @@ logger = logging.getLogger(__name__)
 JD_EXTRACTION_PROMPT = """You are a job description analyzer. Extract structured requirements from the JD text below.
 
 Output a JSON object with:
-{
-  "position_title": "",
-  "company": "",
-  "hard_requirements": [{"criterion": "", "type": "must_have"}],
-  "nice_to_have": [{"criterion": "", "type": "plus"}],
-  "soft_signals": [{"phrase": "", "interpretation": "", "risk_level": "info|warning|caution"}],
-  "keyword_frequency": {"keyword": count}
-}
+{{"position_title": "", "company": "", "hard_requirements": [{{"criterion": "", "type": "must_have"}}], "nice_to_have": [{{"criterion": "", "type": "plus"}}], "soft_signals": [{{"phrase": "", "interpretation": "", "risk_level": "info|warning|caution"}}], "keyword_frequency": {{"keyword": count}}}}
 
 Rules:
 - hard_requirements: explicit must-haves (years of experience, degree, specific technologies, certifications)
@@ -30,7 +23,7 @@ Rules:
 - keyword_frequency: count key technical/business terms
 
 JD Text:
-{jd_text}
+JD_TEXT_HERE
 
 Output ONLY valid JSON:"""
 
@@ -60,14 +53,17 @@ class JDParser:
                 temperature=0.0,
                 messages=[{
                     "role": "user",
-                    "content": JD_EXTRACTION_PROMPT.format(
-                        jd_text=jd_text[:8000].replace("{", "{{").replace("}", "}}")
+                    "content": JD_EXTRACTION_PROMPT.replace(
+                        "JD_TEXT_HERE", jd_text[:8000].replace("{", "{{").replace("}", "}}")
                     ),
                 }],
             )
 
             content = self._extract_text(response)
-            data = json.loads(self._clean_json(content))
+            cleaned = self._clean_json(content)
+            logger.info("JD LLM raw (first 500): %s", content[:500])
+            logger.info("JD LLM cleaned (first 500): %s", cleaned[:500])
+            data = json.loads(cleaned)
 
             return JDRequirements(
                 raw_text=jd_text,
@@ -125,4 +121,9 @@ class JDParser:
         if text.startswith("```"):
             lines = text.split("\n")
             text = "\n".join(lines[1:-1])
+        # Find outermost { }
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start:end + 1]
         return text

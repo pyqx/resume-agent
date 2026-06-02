@@ -25,8 +25,14 @@ async def parse_jd(request: Request):
     if not jd_text:
         raise HTTPException(status_code=400, detail="jd_text is required")
 
+    logger.info("JD parse: input length=%d preview=%s", len(jd_text), jd_text[:200])
     parser = JDParser()
     jd_reqs = await parser.parse(jd_text)
+
+    logger.info("JD parse result: title=%s company=%s hard=%d nice=%d keywords=%d signals=%d",
+                jd_reqs.position_title, jd_reqs.company,
+                len(jd_reqs.hard_requirements), len(jd_reqs.nice_to_have),
+                len(jd_reqs.keyword_frequency), len(jd_reqs.soft_signals))
 
     # Also detect signals
     detector = SignalDetector()
@@ -46,6 +52,8 @@ async def match_jd(request: Request):
     if not jd_text:
         raise HTTPException(status_code=400, detail="jd_text is required")
 
+    logger.info("JD match: input length=%d resume_id=%s", len(jd_text), resume_id or "(auto)")
+
     # Get resume
     resume = None
     if resume_id:
@@ -56,13 +64,22 @@ async def match_jd(request: Request):
     if not resume:
         raise HTTPException(status_code=404, detail="No resume found. Upload a resume first.")
 
+    logger.info("JD match: resume found id=%s name=%s", resume.id, resume.personal_info.full_name)
+
     # Parse JD
     parser = JDParser()
     jd_reqs = await parser.parse(jd_text)
+    logger.info("JD match: parsed hard=%d nice=%d keywords=%d",
+                len(jd_reqs.hard_requirements), len(jd_reqs.nice_to_have),
+                len(jd_reqs.keyword_frequency))
 
     # Match
     matcher = JDMatcher()
     report = await matcher.match(jd_reqs, resume)
+    logger.info("JD match result: score=%.1f%% must_have=%d/%d plus=%d/%d",
+                report.overall_score,
+                report.must_have_met, report.must_have_total,
+                report.plus_met, report.plus_total)
 
     return report.model_dump(mode="json")
 

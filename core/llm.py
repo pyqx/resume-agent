@@ -102,6 +102,7 @@ class _MessagesProxy:
         for m in messages:
             openai_messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
+        # Try initial call (without response_format — it degrades extraction quality)
         resp = self._openai_client.chat.completions.create(
             model=model,
             messages=openai_messages,
@@ -111,10 +112,53 @@ class _MessagesProxy:
 
         choice = resp.choices[0]
         content_text = choice.message.content or ""
-        # DeepSeek reasoning models may return empty content and put answer in reasoning_content
-        if not content_text and hasattr(choice.message, "reasoning_content"):
-            content_text = choice.message.reasoning_content or ""
+        # DeepSeek reasoning models may put reasoning in reasoning_content and answer in content,
+        # OR may put everything in content (reasoning text before the actual response)
+        rc = getattr(choice.message, "reasoning_content", None)
+        if rc and not content_text:
+            # content is empty, use reasoning_content as fallback
+            content_text = rc or ""
             logger.debug("Falling back to reasoning_content: %s...", content_text[:100])
+        elif rc and content_text:
+            # Both present: try to extract JSON from content by finding first { or [
+            stripped = content_text.strip()
+            has_json = stripped.startswith("{") or stripped.startswith("[")
+            if not has_json:
+                for delim in ("{", "["):
+                    pos = stripped.find(delim)
+                    if pos >= 0:
+                        content_text = stripped[pos:]
+                        has_json = True
+                        break
+            # If content still has no JSON, try reasoning_content (model may have
+            # put the actual response there instead)
+            if not has_json:
+                rc_stripped = rc.strip()
+                for delim in ("{", "["):
+                    pos = rc_stripped.find(delim)
+                    if pos >= 0:
+                        content_text = rc_stripped[pos:]
+                        logger.debug("Fell back to reasoning_content for JSON: %s...", content_text[:100])
+                        break
+
+        # Auto-retry if content has no JSON structure at all (model output pure reasoning text)
+        if not self._looks_like_json(content_text):
+            logger.warning("LLM response missing JSON (no { or [), retrying once with response_format...")
+            openai_messages.append({"role": "assistant", "content": content_text})
+            openai_messages.append({
+                "role": "user",
+                "content": "Output ONLY valid JSON. No explanations, no thinking, no markdown. Start with { or [.",
+            })
+            resp = self._openai_client.chat.completions.create(
+                model=model,
+                messages=openai_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+            content_text = resp.choices[0].message.content or ""
+            logger.info("LLM retry response (first 200): %s", content_text[:200])
+
         inp = resp.usage.prompt_tokens if resp.usage else 0
         out = resp.usage.completion_tokens if resp.usage else 0
 
@@ -123,6 +167,14 @@ class _MessagesProxy:
             model=resp.model,
             usage=_FakeUsage(inp, out),
         )
+
+    @staticmethod
+    def _looks_like_json(text: str) -> bool:
+        """Check if text contains JSON structure ({ or [)."""
+        stripped = text.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            return True
+        return "{" in stripped or "[" in stripped
 
 
 def get_llm_client_from_settings() -> "LLMClient":

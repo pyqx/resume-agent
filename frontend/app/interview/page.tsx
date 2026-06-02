@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useResumeContext } from "@/contexts/ResumeContext";
+import { usePageState } from "@/contexts/PageStateContext";
 
 interface Question {
   question: string;
@@ -36,27 +37,138 @@ interface WeaknessData {
   sample_response?: string;
 }
 
+interface InterviewPersist {
+  questions: InterviewData | null;
+  intro: IntroData | null;
+  weaknesses: WeaknessData[];
+  activeTab: "questions" | "intro" | "weaknesses";
+}
+
+function downloadMarkdown(filename: string, content: string) {
+  const blob = new Blob([content], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function downloadPDF(filename: string, content: string) {
+  try {
+    const res = await fetch("/api/export/pdf-text", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: content, filename }),
+    });
+    if (!res.ok) throw new Error("PDF generation failed");
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename.replace(/\.md$/, ".pdf");
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch {
+    // fallback: download as markdown
+    downloadMarkdown(filename.replace(/\.pdf$/, ".md"), content);
+  }
+}
+
+function questionsToMarkdown(q: InterviewData): string {
+  const lines: string[] = ["# 面试问题\n"];
+  if (q.most_likely_questions?.length) {
+    lines.push("## 最可能被问到的问题\n", ...q.most_likely_questions.map((q) => `- ${q}`), "");
+  }
+  if (q.star_deep_dives?.length) {
+    lines.push("## STAR 深挖追问\n", ...q.star_deep_dives.map((q) => `- ${q.question}${q.dimension ? `（${q.dimension}）` : ""}`), "");
+  }
+  if (q.technical_follow_ups?.length) {
+    lines.push("## 技术深度追问\n", ...q.technical_follow_ups.map((q) => `- ${q.question}${q.technology ? `（${q.technology}）` : ""}`), "");
+  }
+  if (q.behavioral?.length) {
+    lines.push("## 行为面试题\n", ...q.behavioral.map((q) => `- ${q.question}${q.skill_targeted ? `（${q.skill_targeted}）` : ""}`), "");
+  }
+  if (q.pressure_tests?.length) {
+    lines.push("## 压力测试题\n", ...q.pressure_tests.map((q) => `- ${q.question}`), "");
+  }
+  if (q.company_specific_tips?.length) {
+    lines.push("## 公司针对性建议\n", ...q.company_specific_tips.map((t) => `- ${t}`), "");
+  }
+  return lines.join("\n");
+}
+
+function introToMarkdown(i: IntroData): string {
+  return [
+    "# 自我介绍\n",
+    `## 短版（约${i.short_duration_seconds || 60}秒）\n${i.short_version || ""}\n`,
+    `## 长版（约${i.long_duration_seconds || 180}秒）\n${i.long_version || ""}\n`,
+    i.key_messages?.length ? "## 核心信息点\n" + i.key_messages.map((m) => `- ${m}`).join("\n") : "",
+    i.delivery_tips?.length ? "\n## 表达技巧\n" + i.delivery_tips.map((t) => `- ${t}`).join("\n") : "",
+  ].filter(Boolean).join("\n");
+}
+
+function weaknessesToMarkdown(ws: WeaknessData[]): string {
+  const lines = ["# 简历弱点分析与应对\n"];
+  ws.forEach((w, i) => {
+    lines.push(
+      `### ${i + 1}. ${w.concern || ""}（${({ high: "高风险", medium: "中风险", low: "低风险" })[w.risk_level || "medium"]}）`,
+      w.honest_narrative ? `\n**应对策略：** ${w.honest_narrative}` : "",
+      w.sample_response ? `\n**参考话术：** ${w.sample_response}` : "",
+      ""
+    );
+  });
+  return lines.join("\n");
+}
+
 export default function InterviewPage() {
-  const [questions, setQuestions] = useState<InterviewData | null>(null);
-  const [intro, setIntro] = useState<IntroData | null>(null);
-  const [weaknesses, setWeaknesses] = useState<WeaknessData[]>([]);
-  const [activeTab, setActiveTab] = useState<"questions" | "intro" | "weaknesses">("questions");
+  // Persisted state (survives page navigation)
+  const { state: saved, updateState } = usePageState<InterviewPersist>("interview");
+  const [questions, setQuestions] = useState<InterviewData | null>(saved.questions ?? null);
+  const [intro, setIntro] = useState<IntroData | null>(saved.intro ?? null);
+  const [weaknesses, setWeaknesses] = useState<WeaknessData[]>(saved.weaknesses ?? []);
+  const [activeTab, setActiveTab] = useState<"questions" | "intro" | "weaknesses">(saved.activeTab ?? "questions");
+  // Transient state (not preserved across navigation)
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
   const resume = useResumeContext();
+
+  // Sync to persistent store whenever values change
+  useEffect(() => { updateState({ questions }); }, [questions]);
+  useEffect(() => { updateState({ intro }); }, [intro]);
+  useEffect(() => { updateState({ weaknesses }); }, [weaknesses]);
+  useEffect(() => { updateState({ activeTab }); }, [activeTab]);
+
+  // Abort in-flight requests on unmount
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  const fetchJSON = async (url: string): Promise<unknown> => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resume_id: resume.resumeId || undefined }),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+  };
 
   const loadQuestions = async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/interview/questions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resume_id: resume.resumeId || undefined }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      setQuestions(await res.json());
+      const data = await fetchJSON("/api/interview/questions");
+      setQuestions(data as InterviewData);
     } catch (err) {
+      if ((err as Error)?.name === "AbortError") return;
       setError(err instanceof Error ? err.message : "加载失败");
     }
     setLoading(false);
@@ -66,14 +178,10 @@ export default function InterviewPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/interview/intro", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resume_id: resume.resumeId || undefined }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      setIntro(await res.json());
+      const data = await fetchJSON("/api/interview/intro");
+      setIntro(data as IntroData);
     } catch (err) {
+      if ((err as Error)?.name === "AbortError") return;
       setError(err instanceof Error ? err.message : "加载失败");
     }
     setLoading(false);
@@ -83,15 +191,10 @@ export default function InterviewPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/interview/weaknesses", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resume_id: resume.resumeId || undefined }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      const data = await res.json();
-      setWeaknesses(data.weaknesses || []);
+      const data = await fetchJSON("/api/interview/weaknesses");
+      setWeaknesses((data as { weaknesses: WeaknessData[] }).weaknesses || []);
     } catch (err) {
+      if ((err as Error)?.name === "AbortError") return;
       setError(err instanceof Error ? err.message : "加载失败");
     }
     setLoading(false);
@@ -136,24 +239,66 @@ export default function InterviewPage() {
         </div>
 
         {/* 操作按钮 */}
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
           {activeTab === "questions" && (
-            <button onClick={loadQuestions} disabled={loading}
-              className="px-4 py-1.5 bg-primary-600 text-white text-sm rounded-lg hover:bg-primary-700 disabled:opacity-50">
-              生成面试问题
-            </button>
+            <>
+              <button onClick={loadQuestions} disabled={loading}
+                className="px-4 py-1.5 bg-primary-600 text-white text-sm rounded-lg hover:bg-primary-700 disabled:opacity-50">
+                生成面试问题
+              </button>
+              {questions && (
+                <>
+                  <button onClick={() => downloadMarkdown("面试问题.md", questionsToMarkdown(questions))}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50">
+                    导出 Markdown
+                  </button>
+                  <button onClick={() => downloadPDF("面试问题.pdf", questionsToMarkdown(questions))}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50">
+                    导出 PDF
+                  </button>
+                </>
+              )}
+            </>
           )}
           {activeTab === "intro" && (
-            <button onClick={loadIntro} disabled={loading}
-              className="px-4 py-1.5 bg-primary-600 text-white text-sm rounded-lg hover:bg-primary-700 disabled:opacity-50">
-              生成自我介绍
-            </button>
+            <>
+              <button onClick={loadIntro} disabled={loading}
+                className="px-4 py-1.5 bg-primary-600 text-white text-sm rounded-lg hover:bg-primary-700 disabled:opacity-50">
+                生成自我介绍
+              </button>
+              {intro && (
+                <>
+                  <button onClick={() => downloadMarkdown("自我介绍.md", introToMarkdown(intro))}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50">
+                    导出 Markdown
+                  </button>
+                  <button onClick={() => downloadPDF("自我介绍.pdf", introToMarkdown(intro))}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50">
+                    导出 PDF
+                  </button>
+                </>
+              )}
+            </>
           )}
           {activeTab === "weaknesses" && (
-            <button onClick={loadWeaknesses} disabled={loading}
-              className="px-4 py-1.5 bg-primary-600 text-white text-sm rounded-lg hover:bg-primary-700 disabled:opacity-50">
-              分析简历弱点
-            </button>
+            <>
+              <button onClick={loadWeaknesses} disabled={loading}
+                className="px-4 py-1.5 bg-primary-600 text-white text-sm rounded-lg hover:bg-primary-700 disabled:opacity-50">
+                分析简历弱点
+              </button>
+              {weaknesses.length > 0 && (
+                <>
+                  <button onClick={() => downloadMarkdown("弱点分析.md", weaknessesToMarkdown(weaknesses))}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50">
+                    导出 Markdown
+                  </button>
+                  <button onClick={() => downloadPDF("弱点分析.pdf", weaknessesToMarkdown(weaknesses))}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50">
+                    导出 PDF
+                  </button>
+                </>
+              )}
+            </>
           )}
         </div>
         {error && <p className="text-sm text-red-500 mt-2">{error}</p>}

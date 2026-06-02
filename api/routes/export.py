@@ -1,9 +1,12 @@
 """Export API routes — Markdown and PDF export."""
 
 import logging
+import io
+import textwrap
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 
 from core.resume.exporter import ResumeExporter
 from api.routes.resume import _resume_store
@@ -11,6 +14,61 @@ from api.routes.resume import _resume_store
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+@router.post("/pdf-text")
+async def export_pdf_text(request: Request):
+    """Generate a real PDF from plain text content and return as file."""
+    body = await request.json()
+    text = body.get("text", "")
+    filename = body.get("filename", "export.pdf")
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+
+    try:
+        import fitz
+        doc = fitz.open()
+        page = doc.new_page()
+        margin = 50
+        line_height = 16
+        max_width = page.rect.width - 2 * margin
+        y = margin
+        font = "china-s"  # Built-in CJK font supporting Chinese characters
+
+        for line in text.split("\n"):
+            if y > page.rect.height - margin:
+                page = doc.new_page()
+                y = margin
+            # Handle headings: bold = larger font
+            if line.startswith("# ") or line.startswith("## "):
+                fontsize = 14 if line.startswith("# ") else 12
+                line = line.lstrip("#").strip()
+                page.insert_text((margin, y), line, fontsize=fontsize, fontname=font, color=(0, 0, 0))
+                y += line_height + 4
+            else:
+                # Word-wrap long lines
+                wrapped = textwrap.fill(line, width=int(max_width / 6)) if line.strip() else ""
+                for w_line in (wrapped.split("\n") if wrapped else [""]):
+                    if y > page.rect.height - margin:
+                        page = doc.new_page()
+                        y = margin
+                    page.insert_text((margin, y), w_line, fontsize=10, fontname=font, color=(0, 0, 0))
+                    y += line_height
+
+        buf = io.BytesIO()
+        doc.save(buf, garbage=4, deflate=True)
+        doc.close()
+        buf.seek(0)
+
+        return StreamingResponse(
+            buf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename*=utf-8''{quote(filename)}"},
+        )
+    except Exception as e:
+        logger.exception("PDF generation failed")
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
 
 
 @router.post("/markdown")

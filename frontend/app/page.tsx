@@ -24,6 +24,13 @@ export default function Home() {
   const abortRef = useRef<AbortController | null>(null);
   const searchParams = useSearchParams();
 
+  // Abort SSE stream on unmount
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
