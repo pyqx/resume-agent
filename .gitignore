@@ -42,5 +42,9 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# Design documents (not for public repo)
+ResumeAgent-PRD.md
+ResumeAgent-Architecture.md
+
 # Claude
 .claude/
