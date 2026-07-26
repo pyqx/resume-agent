@@ -1,116 +1,103 @@
-"""ResumeSanitizer — mask sensitive information before sending to LLM."""
+"""PII sanitization — mask sensitive values before they leave the process.
 
-import re
-import hashlib
+Two mechanisms:
+- PIIMasker: reversible, per-request masking used by the LLM client. Each
+  distinct value gets its own placeholder (two phone numbers never collide),
+  and placeholders are restored in the LLM's response text.
+- sanitize_text / PIILogFilter: irreversible masking for log output.
+"""
+
 import logging
-from dataclasses import dataclass, field
-from copy import deepcopy
-
-from core.resume.schema import ResumeData, PersonalInfo
+import re
 
 logger = logging.getLogger(__name__)
 
-# Default sensitive field patterns
-DEFAULT_PATTERNS = {
-    "phone": r'(?:\+?86[\s-]?)?1[3-9]\d{9}',
-    "email": r'[\w.+-]+@[\w-]+\.[\w.-]+',
-    "id_number": r'\d{17}[\dXx]',
-    "salary": r'(?:月薪|年薪|薪资|工资|salary)[：:\s]*[\d,.]+[万kwK]?',
-    "full_address": r'(?:地址|住址)[：:\s]*.{5,}',
-    "wechat": r'(?:微信|WeChat|wx)[：:\s]*[\w-]+',
+# Sensitive value patterns. Order matters: more specific first.
+DEFAULT_PATTERNS: dict[str, str] = {
+    "id_number": r"\d{17}[\dXx]",
+    "phone": r"(?:\+?86[\s-]?)?1[3-9]\d{9}",
+    "email": r"[\w.+-]+@[\w-]+\.[\w.-]+",
+    "salary": r"(?:月薪|年薪|薪资|工资|salary)[：:\s]*[\d,.]+\s*[万kwK]?",
+    "wechat": r"(?:微信|WeChat|wx)[号：:\s]+[A-Za-z][\w-]{4,19}",
+    "address": r"(?:地址|住址)[：:]\s*[^\s,，。;；\"']{4,30}",
+}
+
+_COMPILED = {
+    name: re.compile(pattern, re.IGNORECASE) for name, pattern in DEFAULT_PATTERNS.items()
 }
 
 
-@dataclass
-class SanitizerConfig:
-    """Which fields to sanitize and how."""
-    mask_phone: bool = True
-    mask_email: bool = False  # Often needed for format checking
-    mask_address: bool = True
-    mask_salary: bool = True
-    mask_id_number: bool = True
-    mask_company_names: bool = False  # Optionally mask current employer
-    custom_masks: dict[str, str] = field(default_factory=dict)
+class PIIMasker:
+    """Reversible PII masking with per-value placeholders.
 
-
-class ResumeSanitizer:
-    """Sanitize resume data before sending to external services.
-
-    Maintains a mapping table that enables re-identification after LLM processing.
+    Usage (one instance per LLM request):
+        masker = PIIMasker()
+        safe = masker.mask(prompt_text)
+        ...  # send `safe` to the LLM
+        restored = masker.unmask(response_text)
     """
 
-    def __init__(self, config: SanitizerConfig | None = None):
-        self.config = config or SanitizerConfig()
-        self._mapping: dict[str, str] = {}
+    def __init__(self, categories: set[str] | None = None):
+        self._categories = categories or set(DEFAULT_PATTERNS)
+        # original value -> placeholder
+        self._forward: dict[str, str] = {}
+        # placeholder -> original value
+        self._reverse: dict[str, str] = {}
+        self._counters: dict[str, int] = {}
 
-    def sanitize(self, resume: ResumeData) -> tuple[ResumeData, dict[str, str]]:
-        """Sanitize a ResumeData object, returning sanitized copy + mapping table.
+    def _placeholder_for(self, category: str, value: str) -> str:
+        existing = self._forward.get(value)
+        if existing:
+            return existing
+        self._counters[category] = self._counters.get(category, 0) + 1
+        placeholder = f"[PII_{category.upper()}_{self._counters[category]}]"
+        self._forward[value] = placeholder
+        self._reverse[placeholder] = value
+        return placeholder
 
-        The mapping table maps placeholder → original value for re-identification.
-        """
-        self._mapping = {}
-        resume_copy = deepcopy(resume)
-        pi = resume_copy.personal_info
-
-        if self.config.mask_phone and pi.phone:
-            placeholder = self._make_placeholder("phone")
-            self._mapping[placeholder] = pi.phone
-            pi.phone = placeholder
-
-        if self.config.mask_email and pi.email:
-            placeholder = self._make_placeholder("email")
-            self._mapping[placeholder] = pi.email
-            pi.email = placeholder
-
-        if self.config.mask_address and pi.location:
-            placeholder = self._make_placeholder("location")
-            self._mapping[placeholder] = pi.location
-            pi.location = placeholder
-
-        # Apply custom masks
-        for field_name, pattern in self.config.custom_masks.items():
-            if hasattr(pi, field_name):
-                value = getattr(pi, field_name)
-                if value:
-                    placeholder = self._make_placeholder(field_name)
-                    self._mapping[placeholder] = value
-                    setattr(pi, field_name, placeholder)
-
-        return resume_copy, self._mapping
-
-    @staticmethod
-    def sanitize_text(text: str) -> str:
-        """Sanitize plain text by masking common sensitive patterns."""
+    def mask(self, text: str) -> str:
+        if not text:
+            return text
         result = text
-        for pattern_name, pattern in DEFAULT_PATTERNS.items():
-            result = re.sub(
-                pattern,
-                lambda m: f"[REDACTED:{pattern_name}]",
-                result,
-                flags=re.IGNORECASE,
+        for category, regex in _COMPILED.items():
+            if category not in self._categories:
+                continue
+            result = regex.sub(
+                lambda m, c=category: self._placeholder_for(c, m.group(0)), result
             )
         return result
 
-    def resanitize(self, text: str, reverse: bool = True) -> str:
-        """Replace placeholders with original values (or vice versa)."""
+    def unmask(self, text: str) -> str:
+        if not text or not self._reverse:
+            return text
         result = text
-        if reverse:
-            for placeholder, original in self._mapping.items():
-                result = result.replace(placeholder, original)
-        else:
-            for original, placeholder in self._mapping.items():
-                result = result.replace(original, placeholder)
+        for placeholder, original in self._reverse.items():
+            result = result.replace(placeholder, original)
         return result
 
-    def get_mapping(self) -> dict[str, str]:
-        return dict(self._mapping)
+    @property
+    def masked_count(self) -> int:
+        return len(self._reverse)
 
-    def clear(self):
-        """Clear the mapping table (for cleanup)."""
-        self._mapping.clear()
 
-    @staticmethod
-    def _make_placeholder(field: str) -> str:
-        """Generate a consistent placeholder for a field."""
-        suffix = hashlib.md5(field.encode()).hexdigest()[:8]
-        return f"[REDACTED_{field}_{suffix}]"
+def sanitize_text(text: str) -> str:
+    """Irreversibly mask sensitive patterns (for logs and display)."""
+    result = text
+    for pattern_name, regex in _COMPILED.items():
+        result = regex.sub(f"[REDACTED:{pattern_name}]", result)
+    return result
+
+
+class PIILogFilter(logging.Filter):
+    """Logging filter that masks PII in formatted log messages."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+            masked = sanitize_text(message)
+            if masked != message:
+                record.msg = masked
+                record.args = ()
+        except Exception:
+            pass
+        return True

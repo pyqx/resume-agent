@@ -1,11 +1,5 @@
-from agent.loop import AgentLoop, LoopContext, LoopState
-from agent.context import ContextAssembler
-from agent.planner import Planner, StrategicPlan, Milestone, MilestoneStatus, TacticalStep
-from agent.checkpoint import CheckpointManager, Checkpoint
+"""agent — the reasoning core (loop, context, checkpoint, memory, tools).
 
-__all__ = [
-    "AgentLoop", "LoopContext", "LoopState",
-    "ContextAssembler",
-    "Planner", "StrategicPlan", "Milestone", "MilestoneStatus", "TacticalStep",
-    "CheckpointManager", "Checkpoint",
-]
+Import submodules directly (e.g. ``from agent.loop import AgentLoop``);
+this package __init__ stays empty to avoid heavy import-time side effects.
+"""

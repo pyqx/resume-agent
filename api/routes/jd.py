@@ -1,136 +1,180 @@
 """JD matching API routes."""
 
 import logging
-from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field, ValidationError
+from starlette.requests import Request
 
-from core.jd.parser import JDParser
-from core.jd.matcher import JDMatcher
-from core.jd.signal_detector import SignalDetector
-from api.routes.resume import _resume_store
+from api.deps import get_llm_client, get_disk_cache
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_MAX_JD_CHARS = 20000
+
+_parser = None
+_matcher = None
+_detector = None
+
+
+def _get_parser():
+    global _parser
+    if _parser is None:
+        from core.jd.parser import JDParser
+        _parser = JDParser(llm_client=get_llm_client())
+    return _parser
+
+
+def _get_matcher():
+    global _matcher
+    if _matcher is None:
+        from core.jd.matcher import JDMatcher
+        _matcher = JDMatcher(llm_client=get_llm_client(), cache=get_disk_cache())
+    return _matcher
+
+
+def _get_detector():
+    global _detector
+    if _detector is None:
+        from core.jd.signal_detector import SignalDetector
+        _detector = SignalDetector()
+    return _detector
+
+
+class JDTextRequest(BaseModel):
+    jd_text: str = Field(min_length=10, max_length=_MAX_JD_CHARS)
+    resume_id: str = ""
+
+
+async def _parse_body(request: Request, model):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体不是合法的 JSON")
+    try:
+        return model.model_validate(body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors()[:3])
+
+
+def _merged_signals(jd_reqs, jd_text: str):
+    """Rule-detected signals + LLM-extracted signals, deduped by phrase.
+
+    Previously /parse overwrote the LLM's signals with rules while /match
+    kept only the LLM's — two endpoints disagreed on the same JD.
+    """
+    rule_signals = _get_detector().detect(jd_text)
+    seen = {s.phrase for s in rule_signals}
+    merged = list(rule_signals)
+    for s in jd_reqs.soft_signals:
+        if s.phrase and s.phrase not in seen:
+            merged.append(s)
+            seen.add(s.phrase)
+    return merged
+
 
 @router.post("/parse")
 async def parse_jd(request: Request):
     """Parse a job description text into structured requirements."""
-    body = await request.json()
-    jd_text = body.get("jd_text", "")
+    req = await _parse_body(request, JDTextRequest)
 
-    if not jd_text:
-        raise HTTPException(status_code=400, detail="jd_text is required")
+    logger.info("JD parse: input length=%d", len(req.jd_text))
+    try:
+        jd_reqs = await _get_parser().parse(req.jd_text)
+    except RuntimeError as e:
+        logger.warning("JD parse failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"JD 解析失败,请稍后重试({e})")
 
-    logger.info("JD parse: input length=%d preview=%s", len(jd_text), jd_text[:200])
-    parser = JDParser()
-    jd_reqs = await parser.parse(jd_text)
-
-    logger.info("JD parse result: title=%s company=%s hard=%d nice=%d keywords=%d signals=%d",
-                jd_reqs.position_title, jd_reqs.company,
-                len(jd_reqs.hard_requirements), len(jd_reqs.nice_to_have),
-                len(jd_reqs.keyword_frequency), len(jd_reqs.soft_signals))
-
-    # Also detect signals
-    detector = SignalDetector()
-    signals = detector.detect(jd_text)
-    jd_reqs.soft_signals = signals
-
+    jd_reqs.soft_signals = _merged_signals(jd_reqs, req.jd_text)
+    logger.info(
+        "JD parse result: hard=%d nice=%d keywords=%d signals=%d",
+        len(jd_reqs.hard_requirements), len(jd_reqs.nice_to_have),
+        len(jd_reqs.keyword_frequency), len(jd_reqs.soft_signals),
+    )
     return jd_reqs.model_dump(mode="json")
 
 
 @router.post("/match")
 async def match_jd(request: Request):
-    """Match a JD against a resume and generate a match report."""
-    body = await request.json()
-    jd_text = body.get("jd_text", "")
-    resume_id = body.get("resume_id", "")
+    """Match a JD against a resume and generate a match report.
 
-    if not jd_text:
-        raise HTTPException(status_code=400, detail="jd_text is required")
+    Response is the MatchReport (top-level, backward compatible) plus a
+    "jd_requirements" key so the frontend needs only this one call.
+    """
+    req = await _parse_body(request, JDTextRequest)
 
-    logger.info("JD match: input length=%d resume_id=%s", len(jd_text), resume_id or "(auto)")
-
-    # Get resume
-    resume = None
-    if resume_id:
-        resume = _resume_store.get(resume_id)
-    elif _resume_store:
-        resume = next(iter(_resume_store.values()))
-
+    from api.routes.resume import resolve_resume
+    resume = resolve_resume(req.resume_id)
     if not resume:
-        raise HTTPException(status_code=404, detail="No resume found. Upload a resume first.")
+        raise HTTPException(status_code=404, detail="未找到简历,请先上传或选择简历")
 
-    logger.info("JD match: resume found id=%s name=%s", resume.id, resume.personal_info.full_name)
+    logger.info("JD match: input length=%d resume=%s", len(req.jd_text), resume.id)
+    try:
+        jd_reqs = await _get_parser().parse(req.jd_text)
+        jd_reqs.soft_signals = _merged_signals(jd_reqs, req.jd_text)
+        report = await _get_matcher().match(jd_reqs, resume)
+    except RuntimeError as e:
+        logger.warning("JD match failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"匹配失败,请稍后重试({e})")
 
-    # Parse JD
-    parser = JDParser()
-    jd_reqs = await parser.parse(jd_text)
-    logger.info("JD match: parsed hard=%d nice=%d keywords=%d",
-                len(jd_reqs.hard_requirements), len(jd_reqs.nice_to_have),
-                len(jd_reqs.keyword_frequency))
-
-    # Match
-    matcher = JDMatcher()
-    report = await matcher.match(jd_reqs, resume)
-    logger.info("JD match result: score=%.1f%% must_have=%d/%d plus=%d/%d",
-                report.overall_score,
-                report.must_have_met, report.must_have_total,
-                report.plus_met, report.plus_total)
-
-    return report.model_dump(mode="json")
+    logger.info(
+        "JD match result: score=%.1f%% must=%d/%d plus=%d/%d errors=%d",
+        report.overall_score, report.must_have_met, report.must_have_total,
+        report.plus_met, report.plus_total, report.scoring_errors,
+    )
+    payload = report.model_dump(mode="json")
+    payload["jd_requirements"] = jd_reqs.model_dump(mode="json")
+    return payload
 
 
 @router.post("/signals")
 async def detect_signals(request: Request):
-    """Detect hidden signals in a JD text."""
-    body = await request.json()
-    jd_text = body.get("jd_text", "")
-
-    if not jd_text:
-        raise HTTPException(status_code=400, detail="jd_text is required")
-
-    detector = SignalDetector()
-    signals = detector.detect(jd_text)
-
+    """Detect hidden signals in a JD text (rule-based, instant)."""
+    req = await _parse_body(request, JDTextRequest)
+    signals = _get_detector().detect(req.jd_text)
     return {"signals": [s.model_dump(mode="json") for s in signals]}
+
+
+class KeywordRequest(BaseModel):
+    jd_text: str = Field(default="", max_length=_MAX_JD_CHARS)
+    keywords: list[str] = Field(default_factory=list, max_length=200)
+    resume_id: str = ""
 
 
 @router.post("/keywords")
 async def analyze_keywords(request: Request):
-    """Analyze keyword overlap between a JD and resume."""
-    body = await request.json()
-    jd_text = body.get("jd_text", "")
-    resume_id = body.get("resume_id", "")
+    """Keyword coverage between a JD and the resume.
 
-    if not jd_text:
-        raise HTTPException(status_code=400, detail="jd_text is required")
+    Pass `keywords` (e.g. keys of a previous /parse result's
+    keyword_frequency) to skip the LLM parse; otherwise `jd_text` is parsed.
+    """
+    req = await _parse_body(request, KeywordRequest)
 
-    resume = None
-    if resume_id:
-        resume = _resume_store.get(resume_id)
-    elif _resume_store:
-        resume = next(iter(_resume_store.values()))
+    from api.routes.resume import resolve_resume
+    resume = resolve_resume(req.resume_id)
+    if not resume:
+        raise HTTPException(status_code=404, detail="未找到简历,请先上传或选择简历")
 
-    import json
-    resume_text = json.dumps(resume.model_dump(mode="json"), default=str) if resume else ""
+    keywords = [k for k in (req.keywords or []) if isinstance(k, str) and k.strip()]
+    if not keywords:
+        if not req.jd_text or len(req.jd_text) < 10:
+            raise HTTPException(status_code=400, detail="需要提供 keywords 或 jd_text")
+        try:
+            jd_reqs = await _get_parser().parse(req.jd_text)
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=f"JD 解析失败({e})")
+        keywords = list(jd_reqs.keyword_frequency.keys())
 
-    jd_lower = jd_text.lower()
-    resume_lower = resume_text.lower()
+    if not keywords:
+        return {"coverage_rate": None, "matched_keywords": [], "missing_keywords": [],
+                "note": "该 JD 未提取到关键词"}
 
-    import re
-    tech_words = set(re.findall(r'\b[a-zA-Z+#.-]{2,}\b', jd_lower))
-    common_words = {'the', 'a', 'an', 'is', 'are', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'you', 'will', 'be', 'we', 'our'}
-    jd_keywords = {w for w in tech_words if w not in common_words}
-
-    matched = [kw for kw in jd_keywords if kw in resume_lower]
-    missing = list(jd_keywords - set(matched))
-
+    from core.jd.keywords import compute_keyword_coverage
+    result = compute_keyword_coverage(keywords, resume)
     return {
-        "coverage_rate": round(len(matched) / len(jd_keywords) * 100, 1) if jd_keywords else 0,
-        "matched_keywords": matched[:50],
-        "missing_keywords": missing[:50],
+        "coverage_rate": result.get("coverage_rate"),
+        "matched_keywords": result.get("matched", [])[:50],
+        "missing_keywords": result.get("missing", [])[:50],
     }

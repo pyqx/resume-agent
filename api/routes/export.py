@@ -1,88 +1,172 @@
 """Export API routes — Markdown and PDF export."""
 
-import logging
 import io
-import textwrap
+import logging
+import re
+from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
+from core.config import settings
 from core.resume.exporter import ResumeExporter
-from api.routes.resume import _resume_store
+from api.routes.resume import resolve_resume
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# PyMuPDF built-in CJK font (covers Chinese + Latin glyphs).
+_PDF_FONT = "china-s"
+_PDF_MARGIN = 50
+_BODY_FONTSIZE = 10
+# Exact-prefix markdown headings (#/##/###) with tiered font sizes.
+_HEADING_SIZES = {1: 14, 2: 12, 3: 11}
+_HEADING_RE = re.compile(r"^(#{1,3})\s+")
+
+
+def _sanitize_filename(filename) -> str:
+    """Derive a safe *.pdf download filename from untrusted client input."""
+    if not isinstance(filename, str):
+        filename = ""
+    # Basename only (strips any path components), then drop control chars.
+    name = Path(filename).name
+    name = "".join(ch for ch in name if ch.isprintable()).strip()
+    stem = Path(name).stem.strip().strip(".") if name else ""
+    if not stem:
+        return "export.pdf"
+    return f"{stem}.pdf"
+
+
+def _build_pdf(text: str) -> bytes:
+    """Render text (with #/##/### headings) to a PDF.
+
+    Blocking / CPU-bound (per-character font metrics) — must run in a
+    worker thread, never on the event loop.
+    """
+    import fitz  # PyMuPDF
+
+    def wrap_line(line: str, fontsize: int, max_width: float) -> list[str]:
+        """Greedy per-character wrap using real font metrics.
+
+        Correct for both CJK (no spaces, ~2x glyph width) and Latin text;
+        `current` never exceeds one visual line, so each measurement is cheap.
+        """
+        if not line:
+            return [""]
+        segments: list[str] = []
+        current = ""
+        for ch in line:
+            candidate = current + ch
+            if current and fitz.get_text_length(
+                candidate, fontname=_PDF_FONT, fontsize=fontsize
+            ) > max_width:
+                segments.append(current)
+                current = ch
+            else:
+                current = candidate
+        if current:
+            segments.append(current)
+        return segments
+
+    doc = fitz.open()
+    page = doc.new_page()
+    max_width = page.rect.width - 2 * _PDF_MARGIN
+    y = _PDF_MARGIN
+
+    for raw_line in text.split("\n"):
+        heading = _HEADING_RE.match(raw_line)
+        if heading:
+            fontsize = _HEADING_SIZES[len(heading.group(1))]
+            content = raw_line[heading.end():].strip()
+        else:
+            fontsize = _BODY_FONTSIZE
+            content = raw_line
+        line_height = fontsize * 1.5
+
+        for segment in wrap_line(content, fontsize, max_width):
+            if y > page.rect.height - _PDF_MARGIN:
+                page = doc.new_page()
+                y = _PDF_MARGIN
+            if segment:
+                page.insert_text(
+                    (_PDF_MARGIN, y), segment,
+                    fontsize=fontsize, fontname=_PDF_FONT, color=(0, 0, 0),
+                )
+            y += line_height
+        if heading:
+            y += 4  # extra spacing below headings
+
+    buf = io.BytesIO()
+    doc.save(buf, garbage=4, deflate=True)
+    doc.close()
+    return buf.getvalue()
+
+
+async def _resolve_from_body(request: Request):
+    """Read resume_id from the JSON body and resolve the target resume."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+    resume_id = str(body.get("resume_id") or "")
+    resume = resolve_resume(resume_id)
+    if not resume:
+        raise HTTPException(status_code=404, detail="未找到简历,请先上传或选择")
+    return resume
+
 
 @router.post("/pdf-text")
 async def export_pdf_text(request: Request):
     """Generate a real PDF from plain text content and return as file."""
-    body = await request.json()
-    text = body.get("text", "")
-    filename = body.get("filename", "export.pdf")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
 
+    text = body.get("text", "")
+    if not isinstance(text, str):
+        raise HTTPException(status_code=400, detail="text must be a string")
+    if len(text) > settings.export_text_max_chars:
+        raise HTTPException(
+            status_code=413,
+            detail=f"text too large (max {settings.export_text_max_chars} characters)",
+        )
     if not text.strip():
         raise HTTPException(status_code=400, detail="text is required")
 
+    filename = _sanitize_filename(body.get("filename"))
+
     try:
-        import fitz
-        doc = fitz.open()
-        page = doc.new_page()
-        margin = 50
-        line_height = 16
-        max_width = page.rect.width - 2 * margin
-        y = margin
-        font = "china-s"  # Built-in CJK font supporting Chinese characters
-
-        for line in text.split("\n"):
-            if y > page.rect.height - margin:
-                page = doc.new_page()
-                y = margin
-            # Handle headings: bold = larger font
-            if line.startswith("# ") or line.startswith("## "):
-                fontsize = 14 if line.startswith("# ") else 12
-                line = line.lstrip("#").strip()
-                page.insert_text((margin, y), line, fontsize=fontsize, fontname=font, color=(0, 0, 0))
-                y += line_height + 4
-            else:
-                # Word-wrap long lines
-                wrapped = textwrap.fill(line, width=int(max_width / 6)) if line.strip() else ""
-                for w_line in (wrapped.split("\n") if wrapped else [""]):
-                    if y > page.rect.height - margin:
-                        page = doc.new_page()
-                        y = margin
-                    page.insert_text((margin, y), w_line, fontsize=10, fontname=font, color=(0, 0, 0))
-                    y += line_height
-
-        buf = io.BytesIO()
-        doc.save(buf, garbage=4, deflate=True)
-        doc.close()
-        buf.seek(0)
-
-        return StreamingResponse(
-            buf,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename*=utf-8''{quote(filename)}"},
-        )
-    except Exception as e:
+        pdf_bytes = await run_in_threadpool(_build_pdf, text)
+    except Exception:
         logger.exception("PDF generation failed")
-        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
+        raise HTTPException(status_code=500, detail="PDF generation failed")
+
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename*=utf-8''{quote(filename)}"},
+    )
 
 
 @router.post("/markdown")
 async def export_markdown(request: Request):
     """Export a resume as Markdown text."""
-    body = await request.json()
-    resume_id = body.get("resume_id", "")
+    resume = await _resolve_from_body(request)
 
-    resume = _get_resume(resume_id)
-    if not resume:
-        raise HTTPException(status_code=404, detail="Resume not found")
-
-    exporter = ResumeExporter()
-    markdown = exporter.export_markdown(resume)
+    try:
+        markdown = ResumeExporter().export_markdown(resume)
+    except Exception:
+        logger.exception("Markdown export failed")
+        raise HTTPException(status_code=500, detail="Markdown export failed")
 
     return PlainTextResponse(content=markdown, media_type="text/markdown; charset=utf-8")
 
@@ -90,35 +174,20 @@ async def export_markdown(request: Request):
 @router.post("/html")
 async def export_html(request: Request):
     """Export a resume as HTML (for PDF generation)."""
-    body = await request.json()
-    resume_id = body.get("resume_id", "")
+    resume = await _resolve_from_body(request)
 
-    resume = _get_resume(resume_id)
-    if not resume:
-        raise HTTPException(status_code=404, detail="Resume not found")
+    try:
+        html = ResumeExporter().export_pdf_html(resume)
+    except Exception:
+        logger.exception("HTML export failed")
+        raise HTTPException(status_code=500, detail="HTML export failed")
 
-    exporter = ResumeExporter()
-    html = exporter.export_pdf_html(resume)
-
-    return HTMLResponse(content=html)
-
-
-@router.get("/templates")
-async def list_templates():
-    """List available resume templates."""
-    return {
-        "templates": [
-            {"id": "classic", "name": "经典模板", "description": "适合金融/法律/国企等传统行业"},
-            {"id": "modern", "name": "现代模板", "description": "适合互联网/技术行业"},
-            {"id": "minimal", "name": "极简模板", "description": "适合设计/创意行业"},
-        ]
-    }
-
-
-def _get_resume(resume_id: str = ""):
-    """Helper to get resume from store."""
-    if resume_id:
-        return _resume_store.get(resume_id)
-    if _resume_store:
-        return next(iter(_resume_store.values()))
-    return None
+    return HTMLResponse(
+        content=html,
+        headers={
+            # Text is escaped server-side; CSP is defense-in-depth so nothing
+            # can execute even if this HTML is opened directly in a browser.
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

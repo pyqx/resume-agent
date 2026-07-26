@@ -1,7 +1,10 @@
 """ATSSimulator — simulate how common ATS systems parse a resume."""
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+
+from core.evaluation.render import resume_to_text
+from core.resume.schema import ResumeData
 
 
 @dataclass
@@ -14,178 +17,194 @@ class ATSFieldResult:
 
 @dataclass
 class ATSResult:
-    parsable: bool = True
+    """Legacy container kept for backward-compatible imports.
+
+    ``ATSSimulator.simulate()`` now returns a plain JSON-serializable dict
+    with the same keys; this dataclass remains only because other modules
+    import it from ``core.evaluation``.
+    """
+
     fields: list[ATSFieldResult] = field(default_factory=list)
     format_issues: list[str] = field(default_factory=list)
-    keyword_coverage_pct: float = 0.0
+    keyword_coverage_pct: float | None = 0.0
     score: float = 10.0  # 0-10
 
-    @property
-    def critical_fields_found(self) -> int:
-        return sum(1 for f in self.fields if f.found)
 
-    @property
-    def total_critical_fields(self) -> int:
-        return len(self.fields)
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+# Chinese mobile (optionally prefixed with +86/86, separators stripped first).
+_CN_PHONE_RE = re.compile(r"(?:\+?86)?1[3-9]\d{9}")
+# Loose international format: +country-code and 7-15 digits/separators.
+_INTL_PHONE_RE = re.compile(r"\+?\d[\d\s\-]{6,14}")
+# Control characters (tab excluded — it has a dedicated check; \n \r are fine).
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Replacement char, stray BOM, private-use area — telltale mojibake.
+_MOJIBAKE_RE = re.compile(r"[\ufffd\ufeff\ue000-\uf8ff]")
 
 
 class ATSSimulator:
     """Simulate ATS resume parsing to detect issues before real submission.
 
-    Checks for:
-    - Contact information extractability
-    - Education field detection
-    - Table/image interference
-    - Keyword coverage
+    Checks:
+    - Contact information extractability (name/email/phone, structured fields)
+    - Education / latest job / skills presence (structured fields)
+    - Plain-text format issues on the rendered text (tabs, control chars, mojibake)
+    - Target-keyword coverage — only when target keywords are provided
     """
 
-    # Fields ATS systems typically extract
-    CRITICAL_FIELDS = [
-        "name", "email", "phone", "education", "latest_job", "skills",
-    ]
+    FIELD_COUNT = 6
 
-    # ATS keyword categories
-    COMMON_ATS_KEYWORDS = {
-        "technical": [
-            "python", "java", "javascript", "typescript", "go", "rust", "c++",
-            "react", "vue", "angular", "node", "django", "spring", "flask",
-            "sql", "nosql", "mongodb", "postgresql", "mysql", "redis",
-            "aws", "azure", "gcp", "docker", "kubernetes", "ci/cd",
-            "git", "linux", "agile", "scrum", "rest", "graphql", "api",
-        ],
-        "soft": [
-            "leadership", "communication", "teamwork", "problem-solving",
-            "analytical", "project management", "mentoring",
-            "领导力", "沟通能力", "沟通", "团队合作", "团队协作", "解决问题",
-            "分析能力", "项目管理", "指导", "协调", "组织能力",
-        ],
-        "education": [
-            "bachelor", "master", "phd", "mba", "degree", "university",
-            "本科", "硕士", "博士", "学士", "研究生", "学位", "大学", "学院",
-            "大专", "高中", "学历",
-        ],
-    }
+    def simulate(self, resume: ResumeData, target_keywords: list[str] | None = None) -> dict:
+        """Run the ATS simulation. Returns a JSON-serializable dict.
 
-    def simulate(self, resume_text: str, target_keywords: list[str] | None = None) -> ATSResult:
-        """Run ATS simulation on the resume text."""
-        result = ATSResult()
+        Score composition (total is naturally within 0-10, no clamp needed):
+        - with target keywords:    fields 0-4, format 0-3, keywords 0-3
+        - without target keywords: fields 0-6, format 0-4, keyword dimension
+          is skipped (``keyword_coverage_pct`` is None) and its weight is
+          redistributed to the other two.
+        """
+        text = resume_to_text(resume)
 
-        # Check each critical field
-        result.fields = [
-            self._check_name(resume_text),
-            self._check_email(resume_text),
-            self._check_phone(resume_text),
-            self._check_education(resume_text),
-            self._check_latest_job(resume_text),
-            self._check_skills(resume_text),
+        fields = [
+            self._check_name(resume),
+            self._check_email(resume),
+            self._check_phone(resume),
+            self._check_education(resume),
+            self._check_latest_job(resume),
+            self._check_skills(resume),
         ]
+        fields_found = sum(1 for f in fields if f.found)
+        format_issues = self._check_format(text)
 
-        # Format issues
-        result.format_issues = self._check_format(resume_text)
+        keywords: list[str] = []
+        if target_keywords:
+            # De-duplicate, preserve order, drop blanks.
+            keywords = [
+                k for k in dict.fromkeys(kw.strip() for kw in target_keywords if kw and kw.strip())
+            ]
 
-        # Keyword coverage
-        result.keyword_coverage_pct = self._check_keyword_coverage(
-            resume_text.lower(), target_keywords
-        )
+        note = None
+        if keywords:
+            text_lower = text.lower()
+            matched = [kw for kw in keywords if kw.lower() in text_lower]
+            missing = [kw for kw in keywords if kw.lower() not in text_lower]
+            coverage: float | None = round(len(matched) / len(keywords) * 100, 1)
+            field_score = fields_found / len(fields) * 4  # 0-4
+            format_score = max(0.0, 3.0 - len(format_issues))  # 0-3
+            keyword_score: float | None = round(coverage / 100 * 3, 2)  # 0-3
+        else:
+            matched, missing = [], []
+            coverage = None
+            keyword_score = None
+            field_score = fields_found / len(fields) * 6  # 0-6
+            format_score = max(0.0, 4.0 - len(format_issues))  # 0-4
+            note = "no target keywords provided"
 
-        # Score
-        field_score = sum(1 for f in result.fields if f.found) / len(result.fields) * 7
-        format_score = (5 - min(5, len(result.format_issues))) * 0.6
-        keyword_score = min(3, result.keyword_coverage_pct / 33)
+        score = round(field_score + format_score + (keyword_score or 0.0), 1)
 
-        result.score = round(field_score + format_score + keyword_score, 1)
-        result.score = max(0.0, min(10.0, result.score))
-
+        result = {
+            "score": score,
+            "fields": [asdict(f) for f in fields],
+            "fields_found": fields_found,
+            "fields_total": len(fields),
+            "format_issues": format_issues,
+            "keyword_coverage_pct": coverage,
+            "matched_keywords": matched,
+            "missing_keywords": missing,
+            "breakdown": {
+                "field_score": round(field_score, 2),
+                "format_score": round(format_score, 2),
+                "keyword_score": keyword_score,
+            },
+        }
+        if note:
+            result["note"] = note
         return result
 
-    def _check_name(self, text: str) -> ATSFieldResult:
-        # Look for a name near the top (first 200 chars)
-        top_section = text[:200]
-        has_name = bool(re.search(r'[一-鿿]{2,4}', top_section)) or \
-                   bool(re.search(r'[A-Z][a-z]+ [A-Z][a-z]+', top_section))
+    # ── Field checks (structured data, not text regex) ─────
+
+    def _check_name(self, resume: ResumeData) -> ATSFieldResult:
+        name = resume.personal_info.full_name.strip()
         return ATSFieldResult(
             field="name",
-            found=has_name,
-            issues=[] if has_name else ["简历开头未检测到姓名"],
+            found=bool(name),
+            value=name,
+            issues=[] if name else ["未填写姓名"],
         )
 
-    def _check_email(self, text: str) -> ATSFieldResult:
-        match = re.search(r'[\w.+-]+@[\w-]+\.[\w.-]+', text)
-        return ATSFieldResult(
-            field="email",
-            found=bool(match),
-            value=match.group() if match else "",
-            issues=[] if match else ["未检测到邮箱地址"],
-        )
+    def _check_email(self, resume: ResumeData) -> ATSFieldResult:
+        email = resume.personal_info.email.strip()
+        if not email:
+            return ATSFieldResult(field="email", found=False, issues=["未填写邮箱地址"])
+        if not _EMAIL_RE.fullmatch(email):
+            return ATSFieldResult(
+                field="email", found=False, value=email,
+                issues=["邮箱格式可能无法被ATS识别"],
+            )
+        return ATSFieldResult(field="email", found=True, value=email)
 
-    def _check_phone(self, text: str) -> ATSFieldResult:
-        match = re.search(r'(?:\+86|86)?1[3-9]\d{9}', text)
-        return ATSFieldResult(
-            field="phone",
-            found=bool(match),
-            value=match.group() if match else "",
-            issues=[] if match else ["未检测到手机号"],
-        )
+    def _check_phone(self, resume: ResumeData) -> ATSFieldResult:
+        phone = resume.personal_info.phone.strip()
+        if not phone:
+            return ATSFieldResult(field="phone", found=False, issues=["未填写手机号"])
+        compact = re.sub(r"[\s\-]", "", phone)
+        valid = bool(_CN_PHONE_RE.fullmatch(compact)) or bool(_INTL_PHONE_RE.fullmatch(phone))
+        if not valid:
+            return ATSFieldResult(
+                field="phone", found=False, value=phone,
+                issues=["手机号格式可能无法被ATS识别"],
+            )
+        return ATSFieldResult(field="phone", found=True, value=phone)
 
-    def _check_education(self, text: str) -> ATSFieldResult:
-        edu_keywords = [
-            "大学", "学院", "university", "college", "本科", "硕士", "博士",
-            "bachelor", "master", "phd", "degree",
-        ]
-        found = any(kw in text.lower() for kw in edu_keywords)
+    def _check_education(self, resume: ResumeData) -> ATSFieldResult:
+        found = len(resume.education) > 0
+        value = resume.education[0].school if found else ""
         return ATSFieldResult(
             field="education",
             found=found,
+            value=value,
             issues=[] if found else ["未检测到教育经历"],
         )
 
-    def _check_latest_job(self, text: str) -> ATSFieldResult:
-        job_keywords = ["公司", "corporation", "inc", "ltd", "工作经历", "experience"]
-        found = any(kw in text.lower() for kw in job_keywords)
+    def _check_latest_job(self, resume: ResumeData) -> ATSFieldResult:
+        found = len(resume.work_experience) > 0
+        value = ""
+        if found:
+            latest = resume.work_experience[0]
+            value = " ".join(x for x in (latest.company, latest.position) if x)
         return ATSFieldResult(
             field="latest_job",
             found=found,
+            value=value,
             issues=[] if found else ["未检测到工作经历"],
         )
 
-    def _check_skills(self, text: str) -> ATSFieldResult:
-        # Check if at least 3 technical skills are present
-        text_lower = text.lower()
-        found_skills = [kw for kw in self.COMMON_ATS_KEYWORDS["technical"] if kw in text_lower]
-        has_skills = len(found_skills) >= 3
+    def _check_skills(self, resume: ResumeData) -> ATSFieldResult:
+        count = len(resume.skills)
         return ATSFieldResult(
             field="skills",
-            found=has_skills,
-            value=f"{len(found_skills)} skills detected",
-            issues=[f"技能关键词较少 ({len(found_skills)}个)"] if not has_skills else [],
+            found=count > 0,
+            value=f"{count} skills",
+            issues=[] if count > 0 else ["未检测到技能列表"],
         )
+
+    # ── Format checks (rendered text) ──────────────────────
 
     def _check_format(self, text: str) -> list[str]:
         issues = []
 
-        # Check for common format problems
         if "\t" in text:
             issues.append("包含制表符，可能干扰ATS解析")
 
-        # Check for non-ASCII friendly characters
-        special_chars = re.findall(r'[^\x00-\x7F一-鿿\s\w,.!?;:()\[\]@#/-]', text)
-        if special_chars:
-            issues.append(f"包含特殊字符可能无法被ATS识别: {special_chars[:5]}")
+        control_count = len(_CONTROL_CHARS_RE.findall(text))
+        if control_count:
+            issues.append(f"包含 {control_count} 个控制字符，可能干扰ATS解析")
 
-        # Check if there's enough text
+        mojibake = sorted(set(_MOJIBAKE_RE.findall(text)))
+        if mojibake:
+            shown = " ".join(repr(c) for c in mojibake[:5])
+            issues.append(f"包含疑似乱码字符: {shown}")
+
         if len(text) < 100:
             issues.append("简历内容过短，ATS可能认为不完整")
 
         return issues
-
-    def _check_keyword_coverage(self, text: str, target_keywords: list[str] | None = None) -> float:
-        if target_keywords:
-            keywords = set(k.lower() for k in target_keywords)
-        else:
-            keywords = set(self.COMMON_ATS_KEYWORDS["technical"] + self.COMMON_ATS_KEYWORDS["soft"])
-
-        if not keywords:
-            return 100.0
-
-        matched = sum(1 for kw in keywords if kw in text)
-        return round(matched / len(keywords) * 100, 1)

@@ -1,13 +1,17 @@
 """Interview preparation tools — questions, self-intro, weakness analysis."""
 
+import logging
+
 from agent.tools.base import BaseTool, ToolMetadata, ToolResult, ToolCategory, Difficulty
+
+logger = logging.getLogger(__name__)
 
 
 class GenerateInterviewQuestionsTool(BaseTool):
-    def __init__(self, question_generator, get_resume_fn, get_jd_fn=None):
+    def __init__(self, question_generator, get_resume_fn, jd_parser=None):
         self._generator = question_generator
         self._get_resume = get_resume_fn
-        self._get_jd = get_jd_fn
+        self._jd_parser = jd_parser
 
     @property
     def metadata(self) -> ToolMetadata:
@@ -15,28 +19,32 @@ class GenerateInterviewQuestionsTool(BaseTool):
             name="generate_interview_questions",
             category=ToolCategory.INTERVIEW,
             description="Generate targeted interview questions (STAR deep-dives, technical follow-ups, behavioral, pressure tests) from resume",
-            usage_guide="Use when preparing for an interview. Best with both resume and JD loaded for targeted questions.",
+            usage_guide="Use when preparing for an interview. Pass the JD text from the conversation when available — questions become job-targeted.",
+            parameters={
+                "jd_text": "string, optional — the target job description for targeted questions",
+            },
             preconditions=["resume_loaded"],
             estimated_time=Difficulty.MEDIUM,
         )
 
-    async def execute(self, **kwargs) -> ToolResult:
+    async def execute(self, jd_text: str = "", **kwargs) -> ToolResult:
         try:
             resume = self._get_resume()
             if not resume:
-                return ToolResult.fail("NO_RESUME", "No resume loaded")
+                return ToolResult.fail("NO_RESUME", "No resume loaded", is_retryable=False)
 
             jd = None
-            if self._get_jd:
+            if jd_text and self._jd_parser:
                 try:
-                    jd = self._get_jd()
-                except Exception:
-                    pass
+                    jd = await self._jd_parser.parse(str(jd_text))
+                except Exception as e:
+                    logger.warning("JD parse failed for interview questions; proceeding without JD: %s", e)
 
             result = await self._generator.generate(resume, jd)
             return ToolResult.ok(result)
         except Exception as e:
-            return ToolResult.fail("QUESTIONS_ERROR", str(e), is_retryable=True)
+            logger.warning("generate_interview_questions failed: %s", e)
+            return ToolResult.fail("QUESTIONS_ERROR", str(e), is_retryable=False)
 
 
 class GenerateSelfIntroTool(BaseTool):
@@ -59,12 +67,13 @@ class GenerateSelfIntroTool(BaseTool):
         try:
             resume = self._get_resume()
             if not resume:
-                return ToolResult.fail("NO_RESUME", "No resume loaded")
+                return ToolResult.fail("NO_RESUME", "No resume loaded", is_retryable=False)
 
             result = await self._generator.generate(resume)
             return ToolResult.ok(result)
         except Exception as e:
-            return ToolResult.fail("INTRO_ERROR", str(e), is_retryable=True)
+            logger.warning("generate_self_intro failed: %s", e)
+            return ToolResult.fail("INTRO_ERROR", str(e), is_retryable=False)
 
 
 class AnalyzeResumeWeaknessesTool(BaseTool):
@@ -77,7 +86,7 @@ class AnalyzeResumeWeaknessesTool(BaseTool):
         return ToolMetadata(
             name="analyze_resume_weaknesses",
             category=ToolCategory.INTERVIEW,
-            description="Detect resume vulnerabilities (gaps, job hopping, etc.) and generate honest narrative strategies",
+            description="Detect resume vulnerabilities (gaps, job hopping, weak content) and generate honest narrative strategies",
             usage_guide="Use to prepare for tough interview questions about employment gaps, frequent changes, or career pivots.",
             preconditions=["resume_loaded"],
             estimated_time=Difficulty.MEDIUM,
@@ -87,9 +96,10 @@ class AnalyzeResumeWeaknessesTool(BaseTool):
         try:
             resume = self._get_resume()
             if not resume:
-                return ToolResult.fail("NO_RESUME", "No resume loaded")
+                return ToolResult.fail("NO_RESUME", "No resume loaded", is_retryable=False)
 
             result = await self._strategist.analyze(resume)
             return ToolResult.ok(result)
         except Exception as e:
-            return ToolResult.fail("WEAKNESS_ERROR", str(e), is_retryable=True)
+            logger.warning("analyze_resume_weaknesses failed: %s", e)
+            return ToolResult.fail("WEAKNESS_ERROR", str(e), is_retryable=False)

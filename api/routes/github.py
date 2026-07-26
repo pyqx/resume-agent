@@ -3,75 +3,155 @@
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field, ValidationError
 from sse_starlette.sse import EventSourceResponse
+from starlette.requests import Request
 
-from core.github.analyzer import GitHubAnalyzer
-from core.cache import get_cache
+from api.deps import get_llm_client, get_disk_cache
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_analyzer = None
+
+# Per-event payload budget. Data is SHRUNK structurally (long strings and
+# lists trimmed) and then serialized — never sliced after json.dumps, which
+# used to produce unparseable JSON fragments.
+_EVENT_BUDGET = 8000
+
+
+def _get_analyzer():
+    global _analyzer
+    if _analyzer is None:
+        from core.github.analyzer import GitHubAnalyzer
+        _analyzer = GitHubAnalyzer(llm_client=get_llm_client(), cache=get_disk_cache())
+    return _analyzer
+
+
+def _shrink(obj, str_limit: int = 2000, list_limit: int = 10):
+    """Recursively bound string/list sizes so the serialized JSON stays valid."""
+    if isinstance(obj, str):
+        return obj if len(obj) <= str_limit else obj[:str_limit] + "…(截断)"
+    if isinstance(obj, list):
+        trimmed = [_shrink(x, str_limit, list_limit) for x in obj[:list_limit]]
+        if len(obj) > list_limit:
+            trimmed.append(f"…(+{len(obj) - list_limit} more)")
+        return trimmed
+    if isinstance(obj, dict):
+        return {k: _shrink(v, str_limit, list_limit) for k, v in obj.items()}
+    return obj
+
+
+def _event_json(data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False, default=str)
+    if len(payload) <= _EVENT_BUDGET:
+        return payload
+    return json.dumps(_shrink(data), ensure_ascii=False, default=str)
+
+
+class AnalyzeRequest(BaseModel):
+    repo_url: str = Field(min_length=10, max_length=300)
+
 
 @router.post("/analyze")
 async def analyze_github_repo(request: Request):
     """Progressive 5-stage GitHub repo analysis streamed via SSE."""
-    body = await request.json()
-    repo_url = body.get("repo_url", "")
+    try:
+        body = await request.json()
+        req = AnalyzeRequest.model_validate(body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors()[:3])
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体不是合法的 JSON")
 
-    if not repo_url:
-        raise HTTPException(status_code=400, detail="repo_url is required")
+    from core.github.cloner import RepoCloner
+    if RepoCloner._normalize_url(req.repo_url) is None:
+        raise HTTPException(
+            status_code=400,
+            detail="不是有效的仓库地址(支持 github.com / gitlab.com / gitee.com)",
+        )
 
-    analyzer = GitHubAnalyzer(cache=get_cache())
+    analyzer = _get_analyzer()
+    repo_url = req.repo_url
 
     async def event_generator():
-        # Stage 1: Metadata
-        yield {"event": "stage", "data": '{"stage": 1, "name": "metadata"}'}
-        meta = await analyzer.stage1_metadata(repo_url)
-        yield {"event": "metadata", "data": json.dumps(meta)}
+        try:
+            yield {"event": "stage", "data": json.dumps({"stage": 1, "name": "metadata"})}
+            meta = await analyzer.stage1_metadata(repo_url)
+            yield {"event": "metadata", "data": _event_json(meta)}
 
-        # Stage 2: Structure
-        yield {"event": "stage", "data": '{"stage": 2, "name": "structure"}'}
-        structure = await analyzer.stage2_structure(repo_url)
-        yield {"event": "structure", "data": json.dumps(structure)[:5000]}
+            yield {"event": "stage", "data": json.dumps({"stage": 2, "name": "structure"})}
+            structure = await analyzer.stage2_structure(repo_url)
+            yield {"event": "structure", "data": _event_json(structure)}
 
-        # Stage 3: Deep analysis
-        yield {"event": "stage", "data": '{"stage": 3, "name": "deep_analysis"}'}
-        deep = await analyzer.stage3_deep_analysis(repo_url)
-        yield {"event": "deep_analysis", "data": json.dumps(deep)[:5000]}
+            yield {"event": "stage", "data": json.dumps({"stage": 3, "name": "deep_analysis"})}
+            deep = await analyzer.stage3_deep_analysis(repo_url)
+            yield {"event": "deep_analysis", "data": _event_json(deep)}
 
-        # Combine all analysis for stage 4
-        full_analysis = {
-            "metadata": meta,
-            "structure": structure,
-            "dependencies": deep.get("dependencies", {}),
-            "issues": deep.get("issues", {}),
-        }
+            full_analysis = {
+                "metadata": meta,
+                "structure": structure,
+                "dependencies": deep.get("dependencies", {}),
+                "issues": deep.get("issues", {}),
+            }
 
-        # Stage 4: Suggestions
-        yield {"event": "stage", "data": '{"stage": 4, "name": "suggestions"}'}
-        suggestions = await analyzer.stage4_suggestions(full_analysis)
-        yield {"event": "suggestions", "data": json.dumps(suggestions)[:8000]}
+            # Personalize suggestions with the current resume's direction.
+            from api.routes.resume import resolve_resume
+            career = ""
+            resume = resolve_resume()
+            if resume:
+                career = resume.target_position or (
+                    resume.work_experience[0].position if resume.work_experience else ""
+                )
 
-        # Stage 5: ready for resume entry composition (on-demand)
-        yield {"event": "stage", "data": '{"stage": 5, "name": "ready"}'}
-        yield {"event": "complete", "data": '{"status": "analysis_complete"}'}
+            yield {"event": "stage", "data": json.dumps({"stage": 4, "name": "suggestions"})}
+            suggestions = await analyzer.stage4_suggestions(
+                full_analysis, career_direction=career
+            )
+            yield {"event": "suggestions", "data": _event_json(suggestions)}
+
+            yield {"event": "stage", "data": json.dumps({"stage": 5, "name": "ready"})}
+            yield {"event": "complete", "data": json.dumps({"status": "analysis_complete"})}
+        except Exception as e:
+            # Never let the stream die silently — the frontend needs a
+            # terminal error event to stop its loading state.
+            logger.exception("GitHub analysis failed for %s", repo_url)
+            yield {
+                "event": "error",
+                "data": json.dumps({"error": f"分析失败: {e}"}, ensure_ascii=False),
+            }
+        finally:
+            try:
+                await analyzer.release_clones()
+            except Exception as e:
+                logger.warning("Clone cleanup failed: %s", e)
 
     return EventSourceResponse(event_generator())
+
+
+class ComposeRequest(BaseModel):
+    suggestion: dict
+    repo_context: dict = Field(default_factory=dict)
 
 
 @router.post("/compose-entry")
 async def compose_resume_entry(request: Request):
     """Generate a STAR-format resume entry from a selected suggestion."""
-    body = await request.json()
-    suggestion = body.get("suggestion", {})
-    repo_context = body.get("repo_context", {})
+    try:
+        body = await request.json()
+        req = ComposeRequest.model_validate(body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors()[:3])
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体不是合法的 JSON")
 
-    if not suggestion:
+    if not req.suggestion:
         raise HTTPException(status_code=400, detail="suggestion is required")
 
-    analyzer = GitHubAnalyzer()
-    result = await analyzer.stage5_resume_entry(suggestion, repo_context)
-    return result
+    try:
+        return await _get_analyzer().stage5_resume_entry(req.suggestion, req.repo_context)
+    except RuntimeError as e:
+        logger.warning("Resume entry composition failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"简历条目生成失败,请稍后重试({e})")

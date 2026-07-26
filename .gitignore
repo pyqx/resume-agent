@@ -45,6 +45,11 @@ htmlcov/
 # Design documents (not for public repo)
 ResumeAgent-PRD.md
 ResumeAgent-Architecture.md
+ResumeAgent-TaskList.md
+ResumeAgent-ChangeSummary.md
 
 # Claude
 .claude/
+
+# Build artifacts
+frontend/tsconfig.tsbuildinfo

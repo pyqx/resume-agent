@@ -1,40 +1,42 @@
 """Session history API routes."""
 
-from fastapi import APIRouter, HTTPException
-from api.session_manager import SessionManager
-from api.deps import get_db
+from fastapi import APIRouter, HTTPException, Query
+
+from api.deps import get_session_manager
 
 router = APIRouter()
 
 
 @router.get("/")
-async def list_sessions():
-    db = await get_db()
-    sm = SessionManager(db)
-    sessions = await sm.list_sessions()
+async def list_sessions(
+    user_id: str = Query(default="default"),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    sm = await get_session_manager()
+    sessions = await sm.list_sessions(user_id=user_id, limit=limit)
     return {"sessions": sessions}
 
 
 @router.get("/{session_id}")
 async def get_session(session_id: str):
-    db = await get_db()
-    sm = SessionManager(db)
+    sm = await get_session_manager()
+    session = await sm.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
     messages = await sm.get_messages(session_id)
-    if not messages:
-        raise HTTPException(status_code=404, detail="Session not found")
-    # Get resume_id from sessions table
-    sessions_list = await sm.list_sessions()
-    resume_id = ""
-    for s in sessions_list:
-        if s["id"] == session_id:
-            resume_id = s.get("resume_id") or ""
-            break
-    return {"session_id": session_id, "messages": messages, "resume_id": resume_id}
+    return {
+        "session_id": session_id,
+        "title": session.get("title", ""),
+        "resume_id": session.get("resume_id") or "",
+        "created_at": session.get("created_at", ""),
+        "messages": messages,
+    }
 
 
 @router.delete("/{session_id}")
 async def delete_session(session_id: str):
-    db = await get_db()
-    sm = SessionManager(db)
-    await sm.delete_session(session_id)
+    sm = await get_session_manager()
+    deleted = await sm.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="会话不存在")
     return {"deleted": session_id}

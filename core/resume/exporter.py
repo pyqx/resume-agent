@@ -1,7 +1,8 @@
 """ResumeExporter — export ResumeData to Markdown and PDF."""
 
+import html
 import logging
-from pathlib import Path
+import re
 
 from core.resume.schema import ResumeData
 
@@ -13,7 +14,7 @@ PDF_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <style>
-  body {{ font-family: 'Segoe UI', Arial, sans-serif; max-width: 800px; margin: 40px auto; color: #333; line-height: 1.6; }}
+  body {{ font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif; max-width: 800px; margin: 40px auto; color: #333; line-height: 1.6; }}
   h1 {{ font-size: 24px; border-bottom: 2px solid #2563eb; padding-bottom: 8px; }}
   h2 {{ font-size: 18px; color: #2563eb; margin-top: 24px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }}
   .contact {{ color: #666; font-size: 14px; margin-bottom: 16px; }}
@@ -33,6 +34,12 @@ PDF_TEMPLATE = """<!DOCTYPE html>
 {content}
 </body>
 </html>"""
+
+# Headings are exactly 1-3 leading '#' followed by whitespace; anything else
+# (e.g. "#tag" or "####") is treated as regular text.
+_HEADING_RE = re.compile(r"^(#{1,3})\s+")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_ITALIC_RE = re.compile(r"\*([^*]+?)\*")
 
 
 class ResumeExporter:
@@ -84,7 +91,8 @@ class ResumeExporter:
             for work in resume.work_experience:
                 date_range = self._format_date_range(work.start_date, work.end_date, work.is_current)
                 parts.append(f"### {work.company} — {work.position}")
-                parts.append(f"*{date_range}*")
+                if date_range:
+                    parts.append(f"*{date_range}*")
                 if work.location:
                     parts.append(f"地点: {work.location}")
                 for bullet in work.bullets:
@@ -116,17 +124,15 @@ class ResumeExporter:
         if resume.skills:
             parts.append("## 技能")
             for skill in resume.skills:
-                level_bar = "████" if skill.level else "----"
-                parts.append(f"- **{skill.name}** [{skill.category}] — {skill.years}年")
+                line = f"- **{skill.name}**"
+                if skill.category:
+                    line += f" [{skill.category}]"
+                if skill.years:
+                    line += f" — {skill.years}年"
+                parts.append(line)
             parts.append("")
 
         return "\n".join(parts)
-
-    def export_html(self, resume: ResumeData) -> str:
-        """Render resume as HTML."""
-        md = self.export_markdown(resume)
-        # Simple markdown-to-HTML conversion
-        return self._md_to_html(md)
 
     def export_pdf_html(self, resume: ResumeData) -> str:
         """Render resume as full HTML page for PDF generation."""
@@ -136,80 +142,65 @@ class ResumeExporter:
 
     @staticmethod
     def _format_date_range(start_date, end_date, is_current: bool = False) -> str:
-        """Format a date range for display."""
-        start = str(start_date) if start_date else "?"
+        """Format a date range for display; returns "" when no dates are known."""
+        start = str(start_date) if start_date else ""
         if is_current:
-            return f"{start} — 至今"
-        end = str(end_date) if end_date else "?"
-        return f"{start} — {end}"
+            return f"{start} — 至今" if start else "至今"
+        end = str(end_date) if end_date else ""
+        if start and end:
+            return f"{start} — {end}"
+        # Single-ended range: show the known side only; "" when both missing.
+        return start or end
+
+    @staticmethod
+    def _inline_md(text: str) -> str:
+        """HTML-escape user text, then apply inline markdown (bold/italic).
+
+        Escaping runs first (html.escape replaces '&' before '<'/'>'/quotes),
+        so no raw user content can reach the HTML output; the '*' markers are
+        untouched by escaping and transformed afterwards.
+        """
+        text = html.escape(text)
+        text = _BOLD_RE.sub(r"<strong>\1</strong>", text)
+        text = _ITALIC_RE.sub(r"<em>\1</em>", text)
+        return text
 
     def _md_to_html(self, md: str) -> str:
-        """Basic markdown to HTML conversion (lightweight)."""
-        import re
+        """Lightweight markdown to HTML conversion.
 
-        lines = md.split("\n")
-        html_lines = []
+        Lines are classified by structure first (heading / list item /
+        blockquote / blank / paragraph) so the <ul> state machine always
+        closes correctly — inline bold/italic never affects classification.
+        """
+        html_lines: list[str] = []
         in_list = False
 
-        for line in lines:
-            # Headers
-            if line.startswith("# "):
-                if in_list:
-                    html_lines.append("</ul>")
-                    in_list = False
-                html_lines.append(f'<h1>{line[2:]}</h1>')
-            elif line.startswith("## "):
-                if in_list:
-                    html_lines.append("</ul>")
-                    in_list = False
-                html_lines.append(f'<h2>{line[3:]}</h2>')
-            elif line.startswith("### "):
-                if in_list:
-                    html_lines.append("</ul>")
-                    in_list = False
-                html_lines.append(f'<h3>{line[4:]}</h3>')
-            # Bold
-            elif "**" in line:
-                line = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', line)
-                if line.startswith("- "):
-                    if not in_list:
-                        html_lines.append("<ul>")
-                        in_list = True
-                    html_lines.append(f'<li>{line[2:]}</li>')
-                else:
-                    if in_list:
-                        html_lines.append("</ul>")
-                        in_list = False
-                    html_lines.append(f'<p>{line}</p>')
-            # Italic
-            elif "*" in line:
-                line = re.sub(r'\*(.+?)\*', r'<em>\1</em>', line)
-                html_lines.append(f'<p>{line}</p>')
-            # List items
+        def close_list():
+            nonlocal in_list
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+
+        for line in md.split("\n"):
+            heading = _HEADING_RE.match(line)
+            if heading:
+                close_list()
+                level = len(heading.group(1))
+                content = line[heading.end():].strip()
+                html_lines.append(f"<h{level}>{self._inline_md(content)}</h{level}>")
             elif line.startswith("- "):
                 if not in_list:
                     html_lines.append("<ul>")
                     in_list = True
-                html_lines.append(f'<li>{line[2:]}</li>')
-            # Blockquote
+                html_lines.append(f"<li>{self._inline_md(line[2:])}</li>")
             elif line.startswith("> "):
-                if in_list:
-                    html_lines.append("</ul>")
-                    in_list = False
-                html_lines.append(f'<blockquote>{line[2:]}</blockquote>')
-            # Empty lines
+                close_list()
+                html_lines.append(f"<blockquote>{self._inline_md(line[2:])}</blockquote>")
             elif not line.strip():
-                if in_list:
-                    html_lines.append("</ul>")
-                    in_list = False
-            # Regular text
+                close_list()
             else:
-                if in_list and not line.startswith("- "):
-                    html_lines.append("</ul>")
-                    in_list = False
-                html_lines.append(f'<p>{line}</p>')
+                close_list()
+                html_lines.append(f"<p>{self._inline_md(line)}</p>")
 
-        if in_list:
-            html_lines.append("</ul>")
-
+        close_list()
         return "\n".join(html_lines)

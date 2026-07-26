@@ -30,6 +30,9 @@ class ToolMetadata:
     category: ToolCategory
     description: str
     usage_guide: str
+    # Parameter name -> human-readable description (type + meaning). Rendered
+    # into the LLM manifest so the model doesn't have to guess param names.
+    parameters: dict[str, str] = field(default_factory=dict)
     preconditions: list[str] = field(default_factory=list)
     estimated_time: Difficulty = Difficulty.LIGHT
     is_idempotent: bool = True
@@ -82,23 +85,18 @@ class BaseTool(ABC):
     def to_llm_description(self) -> str:
         """Generate a text description for the LLM's system prompt."""
         m = self.metadata
-        precond = ", ".join(m.preconditions) if m.preconditions else "none"
-        return (
-            f"Tool: {m.name}\n"
-            f"Category: {m.category.value}\n"
-            f"When to use: {m.usage_guide}\n"
-            f"Preconditions: {precond}\n"
-            f"Estimated time: {m.estimated_time.value}\n"
-            f"Idempotent: {m.is_idempotent}"
-        )
-
-    def to_openai_schema(self) -> dict:
-        """Generate an OpenAI-compatible function schema."""
-        return {
-            "type": "function",
-            "function": {
-                "name": self.metadata.name,
-                "description": self.metadata.usage_guide,
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        }
+        lines = [
+            f"Tool: {m.name}",
+            f"When to use: {m.usage_guide}",
+        ]
+        if m.parameters:
+            lines.append("Parameters:")
+            lines.extend(f"  - {name}: {desc}" for name, desc in m.parameters.items())
+        else:
+            lines.append("Parameters: none")
+        if m.requires_user_confirmation:
+            lines.append(
+                "NOTE: destructive — requires explicit user confirmation; "
+                "call with confirm=true only AFTER the user has agreed."
+            )
+        return "\n".join(lines)

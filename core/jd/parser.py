@@ -1,20 +1,30 @@
 """JDParser — structured extraction of job description requirements."""
 
-import json
-import re
 import logging
 
-from core.llm import get_llm_client_from_settings
-
-from core.config import settings
-from core.resume.schema import JDRequirements, Requirement, JDSignal, RequirementType
+from core.llm import (
+    UNTRUSTED_NOTE,
+    get_llm_client_from_settings,
+    parse_json_response,
+    render_prompt,
+    wrap_untrusted,
+)
+from core.resume.schema import JDRequirements, JDSignal, Requirement, RequirementType
 
 logger = logging.getLogger(__name__)
 
-JD_EXTRACTION_PROMPT = """You are a job description analyzer. Extract structured requirements from the JD text below.
+# JD text longer than this is truncated before being sent to the LLM.
+MAX_JD_CHARS = 8000
+
+JD_SYSTEM_PROMPT = (
+    "You are a job description analyzer. Extract structured requirements "
+    "from the job description supplied by the user. " + UNTRUSTED_NOTE
+)
+
+JD_EXTRACTION_PROMPT = """Extract structured requirements from the JD text below.
 
 Output a JSON object with:
-{{"position_title": "", "company": "", "hard_requirements": [{{"criterion": "", "type": "must_have"}}], "nice_to_have": [{{"criterion": "", "type": "plus"}}], "soft_signals": [{{"phrase": "", "interpretation": "", "risk_level": "info|warning|caution"}}], "keyword_frequency": {{"keyword": count}}}}
+{"position_title": "", "company": "", "hard_requirements": [{"criterion": "", "type": "must_have"}], "nice_to_have": [{"criterion": "", "type": "plus"}], "soft_signals": [{"phrase": "", "interpretation": "", "risk_level": "info|warning|caution"}], "keyword_frequency": {"keyword": count}}
 
 Rules:
 - hard_requirements: explicit must-haves (years of experience, degree, specific technologies, certifications)
@@ -23,7 +33,7 @@ Rules:
 - keyword_frequency: count key technical/business terms
 
 JD Text:
-JD_TEXT_HERE
+{jd_text}
 
 Output ONLY valid JSON:"""
 
@@ -41,89 +51,113 @@ class JDParser:
         return self._llm
 
     async def parse(self, jd_text: str) -> JDRequirements:
-        """Parse JD text into structured requirements."""
-        # Quick regex pre-extraction
-        years_pattern = re.findall(r'(\d+)[\s-]*年[\s\w]*经验|(\d+)\+?\s*years?\s*(of\s*)?experience', jd_text, re.IGNORECASE)
-        degree_pattern = re.findall(r'(本科|硕士|博士|大专|bachelor|master|phd|associate)', jd_text, re.IGNORECASE)
+        """Parse JD text into structured requirements.
 
-        try:
-            response = self.llm.messages.create(
-                model=settings.llm_model,
-                max_tokens=2048,
-                temperature=0.0,
-                messages=[{
-                    "role": "user",
-                    "content": JD_EXTRACTION_PROMPT.replace(
-                        "JD_TEXT_HERE", jd_text[:8000].replace("{", "{{").replace("}", "}}")
-                    ),
-                }],
+        Raises RuntimeError when the LLM call or JSON parsing fails, so
+        callers surface a real error instead of silently receiving zero
+        requirements (which rendered as "0% match" with no explanation).
+        """
+        text = jd_text[:MAX_JD_CHARS]
+        if len(jd_text) > MAX_JD_CHARS:
+            logger.warning(
+                "JD text truncated from %d to %d chars before LLM parsing",
+                len(jd_text), MAX_JD_CHARS,
             )
 
-            content = self._extract_text(response)
-            cleaned = self._clean_json(content)
-            logger.info("JD LLM raw (first 500): %s", content[:500])
-            logger.info("JD LLM cleaned (first 500): %s", cleaned[:500])
-            data = json.loads(cleaned)
-
-            return JDRequirements(
-                raw_text=jd_text,
-                position_title=data.get("position_title", ""),
-                company=data.get("company", ""),
-                hard_requirements=[
-                    Requirement(criterion=r["criterion"], type=RequirementType.MUST_HAVE)
-                    for r in data.get("hard_requirements", [])
-                ],
-                nice_to_have=[
-                    Requirement(criterion=r["criterion"], type=RequirementType.PLUS)
-                    for r in data.get("nice_to_have", [])
-                ],
-                soft_signals=[
-                    JDSignal(
-                        phrase=s.get("phrase", ""),
-                        interpretation=s.get("interpretation", ""),
-                        risk_level=s.get("risk_level", "info"),
-                    )
-                    for s in data.get("soft_signals", [])
-                ],
-                keyword_frequency=data.get("keyword_frequency", {}),
-            )
-        except Exception as e:
-            logger.warning(f"JD parsing failed: {e}. Using rule-based fallback.")
-            return self._rule_based_parse(jd_text)
-
-    def _rule_based_parse(self, jd_text: str) -> JDRequirements:
-        """Rule-based JD parsing fallback."""
-        reqs = JDRequirements(raw_text=jd_text)
-
-        # Simple keyword extraction
-        tech_keywords = re.findall(
-            r'\b(Java|Python|Go|Rust|JavaScript|TypeScript|React|Vue|Angular|'
-            r'Spring|Django|Flask|K8s|Kubernetes|Docker|AWS|Azure|GCP|'
-            r'MySQL|PostgreSQL|MongoDB|Redis|Kafka|Elasticsearch)\b',
-            jd_text, re.IGNORECASE
+        prompt = render_prompt(
+            JD_EXTRACTION_PROMPT,
+            jd_text=wrap_untrusted(text, "job_description"),
         )
 
-        for kw in set(tech_keywords):
-            reqs.keyword_frequency[kw] = tech_keywords.count(kw)
+        try:
+            response = await self.llm.messages.create(
+                max_tokens=2048,
+                temperature=0.0,
+                expect_json=True,
+                system=JD_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            data = parse_json_response(response)
+        except Exception as e:
+            logger.error("JD parsing failed: %s", e)
+            raise RuntimeError(f"JD 解析失败: {e}") from e
 
-        return reqs
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"JD 解析失败: LLM 返回的不是 JSON 对象 ({type(data).__name__})"
+            )
+
+        result = JDRequirements(
+            raw_text=jd_text,
+            position_title=str(data.get("position_title") or ""),
+            company=str(data.get("company") or ""),
+            hard_requirements=self._build_requirements(
+                data.get("hard_requirements"), RequirementType.MUST_HAVE
+            ),
+            nice_to_have=self._build_requirements(
+                data.get("nice_to_have"), RequirementType.PLUS
+            ),
+            soft_signals=self._build_signals(data.get("soft_signals")),
+            keyword_frequency=self._build_keyword_frequency(
+                data.get("keyword_frequency")
+            ),
+        )
+        logger.info(
+            "JD parsed: title=%r hard=%d nice=%d signals=%d keywords=%d",
+            result.position_title, len(result.hard_requirements),
+            len(result.nice_to_have), len(result.soft_signals),
+            len(result.keyword_frequency),
+        )
+        return result
 
     @staticmethod
-    def _extract_text(response) -> str:
-        for block in response.content:
-            if hasattr(block, "text"):
-                return block.text
-        return str(response.content)
+    def _build_requirements(raw, req_type: RequirementType) -> list[Requirement]:
+        """Build Requirement entries from LLM output.
+
+        Models sometimes emit "requirement" instead of "criterion" (or bare
+        strings) — accept both; entries with an empty criterion are skipped.
+        """
+        requirements: list[Requirement] = []
+        for r in raw or []:
+            if isinstance(r, dict):
+                criterion = str(r.get("criterion") or r.get("requirement") or "").strip()
+            elif isinstance(r, str):
+                criterion = r.strip()
+            else:
+                continue
+            if not criterion:
+                continue
+            requirements.append(Requirement(criterion=criterion, type=req_type))
+        return requirements
 
     @staticmethod
-    def _clean_json(text: str) -> str:
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1])
-        # Find outermost { }
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            text = text[start:end + 1]
-        return text
+    def _build_signals(raw) -> list[JDSignal]:
+        signals: list[JDSignal] = []
+        for s in raw or []:
+            if not isinstance(s, dict):
+                continue
+            phrase = str(s.get("phrase") or "")
+            interpretation = str(s.get("interpretation") or "")
+            if not phrase and not interpretation:
+                continue
+            signals.append(JDSignal(
+                phrase=phrase,
+                interpretation=interpretation,
+                risk_level=str(s.get("risk_level") or "info"),
+            ))
+        return signals
+
+    @staticmethod
+    def _build_keyword_frequency(raw) -> dict[str, int]:
+        if not isinstance(raw, dict):
+            return {}
+        freq: dict[str, int] = {}
+        for k, v in raw.items():
+            key = str(k).strip()
+            if not key:
+                continue
+            try:
+                freq[key] = int(v)
+            except (TypeError, ValueError):
+                freq[key] = 1
+        return freq

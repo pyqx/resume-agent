@@ -1,40 +1,47 @@
 """Tool registry — dynamic tool discovery, filtering, and permission control."""
 
+import logging
+
 from agent.tools.base import BaseTool, ToolResult
+
+logger = logging.getLogger(__name__)
+
+# Preconditions the registry knows how to evaluate. Unknown precondition
+# strings FAIL CLOSED (tool hidden / execution refused) instead of silently
+# passing.
+_KNOWN_CONDITIONS = {"resume_loaded", "github_url_provided", "jd_loaded"}
 
 
 class ToolRegistry:
-    """Central registry for all tools. Filters tools by context to enforce permissions."""
+    """Central registry for all tools.
+
+    Permission model:
+    - get_manifest() filters what the LLM *sees* by context.
+    - execute() *enforces* the same preconditions plus user-confirmation for
+      destructive tools — visibility filtering alone is advisory, since the
+      model can name any tool.
+    """
 
     def __init__(self):
         self._tools: dict[str, BaseTool] = {}
 
     def register(self, tool: BaseTool):
         """Register a tool instance."""
-        self._tools[tool.metadata.name] = tool
+        name = tool.metadata.name
+        if name in self._tools:
+            logger.warning("Tool '%s' re-registered; overwriting previous instance", name)
+        self._tools[name] = tool
 
     def register_many(self, tools: list[BaseTool]):
-        """Register multiple tool instances."""
         for tool in tools:
             self.register(tool)
 
     def get(self, name: str) -> BaseTool | None:
-        """Get a tool by name."""
         return self._tools.get(name)
 
     def get_manifest(self, context: dict) -> list[BaseTool]:
-        """Return tools applicable to the current context.
-
-        Dynamic filtering ensures the Agent never sees tools it shouldn't use:
-        - No resume uploaded → no resume-editing tools (except parser)
-        - No GitHub URL → no GitHub tools
-        - Sanitization not configured → no tools that send sensitive data to LLM
-        """
-        available = []
-        for tool in self._tools.values():
-            if self._is_applicable(tool, context):
-                available.append(tool)
-        return available
+        """Return tools applicable to the current context."""
+        return [t for t in self._tools.values() if self._is_applicable(t, context)]
 
     def get_llm_manifest_text(self, context: dict) -> str:
         """Generate LLM-readable tool manifest for the system prompt."""
@@ -44,48 +51,78 @@ class ToolRegistry:
         return "\n\n".join(t.to_llm_description() for t in tools)
 
     def list_all(self) -> list[str]:
-        """List all registered tool names."""
         return list(self._tools.keys())
 
-    async def execute(self, name: str, **kwargs) -> ToolResult:
-        """Execute a tool by name with retry logic moved to the Agent loop."""
+    async def execute(self, name: str, _context: dict | None = None, **kwargs) -> ToolResult:
+        """Execute a tool by name, enforcing preconditions and confirmation."""
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult.fail(
                 error_code="TOOL_NOT_FOUND",
-                error_message=f"Tool '{name}' is not registered. Available: {', '.join(self.list_all()[:10])}",
-                is_retryable=True,
-                fallback_suggestion="Try a different tool or respond directly to the user.",
+                error_message=f"Tool '{name}' is not available.",
+                is_retryable=False,
+                fallback_suggestion="Use one of the tools listed in your manifest, or respond directly.",
             )
+
+        if _context is not None:
+            missing = self._unmet_preconditions(tool, _context)
+            if missing:
+                return ToolResult.fail(
+                    error_code="PRECONDITION_NOT_MET",
+                    error_message=(
+                        f"Tool '{name}' requires: {', '.join(missing)}. "
+                        "Gather the missing context first (e.g. ask the user to "
+                        "upload a resume or provide a GitHub URL)."
+                    ),
+                    is_retryable=False,
+                )
+
+        if tool.metadata.requires_user_confirmation and not _is_truthy(kwargs.get("confirm")):
+            return ToolResult.fail(
+                error_code="CONFIRMATION_REQUIRED",
+                error_message=(
+                    f"'{name}' is destructive. Ask the user to explicitly confirm, "
+                    "then call again with confirm=true."
+                ),
+                is_retryable=False,
+            )
+        kwargs.pop("confirm", None)
+
         try:
             return await tool.execute(**kwargs)
         except Exception as e:
+            logger.exception("Tool '%s' raised", name)
+            # Unexpected exceptions are not known-transient: don't auto-retry.
             return ToolResult.fail(
                 error_code="TOOL_EXECUTION_ERROR",
-                error_message=str(e),
-                is_retryable=True,
+                error_message=f"{type(e).__name__}: {e}",
+                is_retryable=False,
             )
 
-    def _is_applicable(self, tool: BaseTool, context: dict) -> bool:
-        """Check if a tool is applicable in the given context."""
-        preconditions = tool.metadata.preconditions
-        if not preconditions:
-            return True
+    def _unmet_preconditions(self, tool: BaseTool, context: dict) -> list[str]:
+        missing = []
+        for condition in tool.metadata.preconditions:
+            if condition not in _KNOWN_CONDITIONS:
+                logger.warning(
+                    "Tool '%s' declares unknown precondition '%s' — failing closed",
+                    tool.metadata.name, condition,
+                )
+                missing.append(condition)
+            elif condition == "resume_loaded" and not context.get("resume_loaded", False):
+                missing.append(condition)
+            elif condition == "github_url_provided" and not context.get("github_url"):
+                missing.append(condition)
+            elif condition == "jd_loaded" and not context.get("jd_loaded", False):
+                missing.append(condition)
+        return missing
 
-        for condition in preconditions:
-            if condition == "resume_loaded":
-                if not context.get("resume_loaded", False):
-                    return False
-            elif condition == "github_url_provided":
-                if not context.get("github_url"):
-                    return False
-            elif condition == "jd_loaded":
-                if not context.get("jd_loaded", False):
-                    return False
-            elif condition == "sanitization_configured":
-                if not context.get("sanitization_configured", False):
-                    return False
-            elif condition == "user_confirmed":
-                if not context.get("user_confirmed", False):
-                    return False
-        return True
+    def _is_applicable(self, tool: BaseTool, context: dict) -> bool:
+        return not self._unmet_preconditions(tool, context)
+
+
+def _is_truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1", "确认", "是")
+    return bool(value)

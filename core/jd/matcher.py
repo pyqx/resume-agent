@@ -1,22 +1,52 @@
-"""JDMatcher — two-stage JD-to-Resume matching (vector recall + LLM rerank)."""
+"""JDMatcher — 将简历渲染为文本,逐条需求由 LLM 评分(有界并发)。"""
 
-import json
+import asyncio
 import hashlib
+import json
 import logging
 
-from core.llm import get_llm_client_from_settings
 from diskcache import Cache
 
-from core.config import settings
+from core.jd.keywords import compute_keyword_coverage
+from core.llm import (
+    UNTRUSTED_NOTE,
+    get_llm_client_from_settings,
+    parse_json_response,
+    render_prompt,
+    wrap_untrusted,
+)
 from core.resume.schema import (
-    ResumeData, JDRequirements, MatchReport, Requirement, MatchLevel,
+    ResumeData, JDRequirements, MatchReport, Requirement, RequirementType, MatchLevel,
 )
 
 logger = logging.getLogger(__name__)
 
-MATCH_PROMPT = """You are a resume-job matching evaluator. Score how well the candidate's experience matches a specific job requirement.
+# Bump this to invalidate cached match reports when the prompt or the
+# scoring logic changes (it is part of the cache key).
+PROMPT_VERSION = "match-v2"
 
-Job Requirement: {requirement}
+# Resume text sent to the LLM is truncated to this many characters.
+MAX_RESUME_CHARS = 4000
+
+# Upper bound on concurrent per-requirement LLM scoring calls.
+MAX_CONCURRENT_SCORES = 4
+
+_LEVEL_SCORES = {
+    MatchLevel.FULL: 1.0,
+    MatchLevel.PARTIAL: 0.5,
+    MatchLevel.NONE: 0.0,
+}
+
+MATCH_SYSTEM_PROMPT = (
+    "You are a resume-job matching evaluator. Score how well the candidate's "
+    "experience matches a specific job requirement. " + UNTRUSTED_NOTE
+)
+
+MATCH_PROMPT = """Score how well the candidate's experience matches this job requirement.
+
+Job Requirement:
+{requirement}
+
 Requirement Type: {req_type}
 
 Candidate's Relevant Experience:
@@ -28,16 +58,17 @@ Score the match as:
 - none: The candidate does not demonstrate this requirement
 
 Output JSON:
-{{"match_level": "full|partial|none", "evidence": "specific evidence from the resume", "suggestion": "how to improve the resume for this requirement (if partial or none)"}}
+{"match_level": "full|partial|none", "evidence": "specific evidence from the resume", "suggestion": "how to improve the resume for this requirement (if partial or none)"}
 
 Output ONLY valid JSON:"""
 
 
 class JDMatcher:
-    """Two-stage JD-to-Resume matcher.
+    """JD-to-Resume matcher.
 
-    Stage 1: ChromaDB vector similarity to find Top-3 relevant resume chunks per JD requirement.
-    Stage 2: LLM rerank to precisely score each match with evidence and suggestions.
+    将简历渲染为纯文本,逐条 JD 需求交给 LLM 评分(asyncio.Semaphore 有界
+    并发),汇总为 MatchReport。结果按 (简历内容 hash + JD 文本 hash +
+    prompt 版本) 在 diskcache 中缓存。
     """
 
     def __init__(
@@ -56,105 +87,153 @@ class JDMatcher:
 
     async def match(self, jd: JDRequirements, resume: ResumeData) -> MatchReport:
         """Run full JD-to-Resume matching."""
-        jd_hash = hashlib.sha256(jd.raw_text.encode()).hexdigest()[:16]
+        jd_hash = hashlib.sha256(jd.raw_text.encode("utf-8")).hexdigest()[:16]
         resume_hash = hashlib.sha256(
-            json.dumps(resume.model_dump(), sort_keys=True, default=str).encode()
+            json.dumps(resume.model_dump(), sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()[:16]
 
-        # Check cache
-        cache_key = f"match_{resume.id}_{jd_hash}_{resume.version}"
-        if self._cache:
-            cached = self._cache.get(cache_key)
+        # Cache key: resume content hash + JD fingerprint + prompt version.
+        # The fingerprint covers the raw JD text AND the requirement list, so
+        # two JDRequirements that share raw_text (or both lack it) but carry
+        # different requirements never serve each other's cached reports.
+        jd_fingerprint = hashlib.sha256(
+            "\n".join(
+                [jd.raw_text]
+                + [
+                    f"{r.type.value}:{r.criterion}"
+                    for r in list(jd.hard_requirements) + list(jd.nice_to_have)
+                ]
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        cache_key = f"match_{resume_hash}_{jd_fingerprint}_{PROMPT_VERSION}"
+        if self._cache is not None:
+            cached = await asyncio.to_thread(self._cache.get, cache_key)
             if cached:
-                logger.debug("Using cached match result")
+                logger.debug("Match report cache hit (key=%s)", cache_key)
                 return MatchReport(**cached)
 
-        # Combine all requirements
         all_requirements = list(jd.hard_requirements) + list(jd.nice_to_have)
-        logger.info("Matcher: total requirements=%d (hard=%d, plus=%d)",
-                    len(all_requirements), len(jd.hard_requirements), len(jd.nice_to_have))
+        logger.info(
+            "Matcher: total requirements=%d (hard=%d, plus=%d)",
+            len(all_requirements), len(jd.hard_requirements), len(jd.nice_to_have),
+        )
 
-        # Stage 1: Build resume text chunks for each section
-        resume_chunks = self._build_resume_chunks(resume)
-        logger.info("Matcher: resume chunks length=%d chars", len(resume_chunks))
+        resume_text = self._build_resume_chunks(resume)
+        if len(resume_text) > MAX_RESUME_CHARS:
+            logger.warning(
+                "Resume text truncated from %d to %d chars for match scoring",
+                len(resume_text), MAX_RESUME_CHARS,
+            )
+            resume_text = resume_text[:MAX_RESUME_CHARS]
 
-        # Stage 2: LLM rerank for each requirement (parallelized in batches)
-        scored_requirements = []
-        for req in all_requirements:
-            logger.debug("Scoring requirement: %s (%s)", req.criterion, req.type.value)
-            scored_req = await self._score_requirement(req, resume_chunks)
-            scored_requirements.append(scored_req)
+        # Score every requirement concurrently, bounded by a semaphore.
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCORES)
 
-        # Compute overall score
-        must_have = [r for r in scored_requirements if r.type.value == "must_have"]
-        plus = [r for r in scored_requirements if r.type.value == "plus"]
+        async def score_bounded(req: Requirement) -> Requirement:
+            async with semaphore:
+                return await self._score_requirement(req, resume_text)
 
-        must_have_met = sum(1 for r in must_have if r.match_level == MatchLevel.FULL)
-        plus_met = sum(1 for r in plus if r.match_level == MatchLevel.FULL)
+        scored: list[Requirement] = list(
+            await asyncio.gather(*(score_bounded(r) for r in all_requirements))
+        )
 
-        # If no requirements were parsed, score is 0 (not 100)
-        if not all_requirements:
+        must_have = [r for r in scored if r.type == RequirementType.MUST_HAVE]
+        plus = [r for r in scored if r.type == RequirementType.PLUS]
+        scoring_errors = sum(1 for r in scored if r.match_level == MatchLevel.ERROR)
+
+        # ERROR entries count neither toward the numerator nor the denominator.
+        must_rate = self._score_rate(
+            [r for r in must_have if r.match_level != MatchLevel.ERROR]
+        )
+        plus_rate = self._score_rate(
+            [r for r in plus if r.match_level != MatchLevel.ERROR]
+        )
+
+        # FULL=1, PARTIAL=0.5, NONE=0. When one group is empty (or fully
+        # errored) the other carries the whole score instead of being capped
+        # by its 0.7/0.3 weight; with nothing scorable at all the score is 0.
+        if must_rate is None and plus_rate is None:
             overall = 0.0
+        elif must_rate is None:
+            overall = round(plus_rate * 100, 1)
+        elif plus_rate is None:
+            overall = round(must_rate * 100, 1)
         else:
-            must_have_score = must_have_met / len(must_have) if must_have else 0.0
-            plus_score = plus_met / len(plus) if plus else 0.0
-            overall = round((must_have_score * 0.7 + plus_score * 0.3) * 100, 1)
+            overall = round((must_rate * 0.7 + plus_rate * 0.3) * 100, 1)
 
         report = MatchReport(
             resume_id=resume.id,
             jd_text_hash=jd_hash,
             overall_score=overall,
-            must_have_met=must_have_met,
+            must_have_met=sum(1 for r in must_have if r.match_level == MatchLevel.FULL),
             must_have_total=len(must_have),
-            plus_met=plus_met,
+            plus_met=sum(1 for r in plus if r.match_level == MatchLevel.FULL),
             plus_total=len(plus),
-            requirements=scored_requirements,
+            requirements=scored,
             signals=jd.soft_signals,
-            keyword_coverage=self._compute_keyword_coverage(jd, resume),
+            keyword_coverage=compute_keyword_coverage(
+                list(jd.keyword_frequency.keys()), resume
+            )["coverage_rate"],
+            scoring_errors=scoring_errors,
         )
 
-        # Cache result
-        if self._cache:
-            self._cache.set(cache_key, report.model_dump(), expire=3600 * 24)
+        # Cache only clean reports — a report with failed scorings would
+        # otherwise pin the failure for the whole TTL.
+        if self._cache is not None and scoring_errors == 0:
+            await asyncio.to_thread(
+                self._cache.set, cache_key, report.model_dump(mode="json"),
+                expire=3600 * 24,
+            )
 
         return report
 
-    async def _score_requirement(self, req: Requirement, chunks: str) -> Requirement:
-        """Use LLM to score a single JD requirement against resume chunks."""
+    @staticmethod
+    def _score_rate(reqs: list[Requirement]) -> float | None:
+        """FULL=1 / PARTIAL=0.5 / NONE=0 的得分率;无可评分条目返回 None。"""
+        if not reqs:
+            return None
+        return sum(_LEVEL_SCORES.get(r.match_level, 0.0) for r in reqs) / len(reqs)
+
+    async def _score_requirement(self, req: Requirement, resume_text: str) -> Requirement:
+        """Use the LLM to score a single JD requirement against the resume."""
+        logger.debug("Scoring requirement: %s (%s)", req.criterion, req.type.value)
+        prompt = render_prompt(
+            MATCH_PROMPT,
+            requirement=wrap_untrusted(req.criterion, "jd_requirement"),
+            req_type=req.type.value,
+            resume_chunks=wrap_untrusted(resume_text, "resume"),
+        )
         try:
-            response = self.llm.messages.create(
-                model=settings.llm_model,
+            response = await self.llm.messages.create(
                 max_tokens=1024,
                 temperature=0.0,
-                messages=[{
-                    "role": "user",
-                    "content": MATCH_PROMPT.format(
-                        requirement=req.criterion.replace("{", "{{").replace("}", "}}"),
-                        req_type=req.type.value,
-                        resume_chunks=chunks[:4000].replace("{", "{{").replace("}", "}}"),
-                    ),
-                }],
+                expect_json=True,
+                system=MATCH_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
             )
+            result = parse_json_response(response)
+            if not isinstance(result, dict):
+                raise ValueError(f"expected a JSON object, got {type(result).__name__}")
 
-            content = self._extract_text(response)
-            content = self._clean_json(content)
-            result = json.loads(content)
+            raw_level = str(result.get("match_level", "")).strip().lower()
+            if raw_level not in ("full", "partial", "none"):
+                raise ValueError(f"invalid match_level: {raw_level!r}")
 
             return Requirement(
                 criterion=req.criterion,
                 type=req.type,
-                match_level=MatchLevel(result.get("match_level", "none")),
-                evidence=result.get("evidence", ""),
-                suggestion=result.get("suggestion", ""),
+                match_level=MatchLevel(raw_level),
+                evidence=str(result.get("evidence") or ""),
+                suggestion=str(result.get("suggestion") or ""),
             )
         except Exception as e:
-            logger.warning(f"Failed to score requirement '{req.criterion}': {e}")
+            logger.warning("Failed to score requirement '%s': %s", req.criterion, e)
             return Requirement(
                 criterion=req.criterion,
                 type=req.type,
-                match_level=MatchLevel.NONE,
+                match_level=MatchLevel.ERROR,
                 evidence="",
-                suggestion="Unable to evaluate this requirement automatically.",
+                suggestion="评分失败,未能自动评估该条需求。",
             )
 
     def _build_resume_chunks(self, resume: ResumeData) -> str:
@@ -187,34 +266,3 @@ class JDMatcher:
             parts.append(f"Education: {e.degree} in {e.major} from {e.school}")
 
         return "\n\n".join(parts)
-
-    @staticmethod
-    def _compute_keyword_coverage(jd: JDRequirements, resume: ResumeData) -> float:
-        """Compute keyword coverage ratio."""
-        if not jd.keyword_frequency:
-            return 0.0
-
-        resume_text = json.dumps(resume.model_dump(), default=str).lower()
-        jd_keywords = set(k.lower() for k in jd.keyword_frequency.keys())
-
-        covered = sum(1 for kw in jd_keywords if kw in resume_text)
-        return round(covered / len(jd_keywords) * 100, 1) if jd_keywords else 0.0
-
-    @staticmethod
-    def _extract_text(response) -> str:
-        for block in response.content:
-            if hasattr(block, "text"):
-                return block.text
-        return str(response.content)
-
-    @staticmethod
-    def _clean_json(text: str) -> str:
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1])
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            text = text[start:end + 1]
-        return text

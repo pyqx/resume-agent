@@ -14,7 +14,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="zh-CN">
-      <body className="flex h-screen overflow-hidden">
+      <body className="flex h-dvh overflow-hidden">
         <AppProviders>{children}</AppProviders>
       </body>
     </html>

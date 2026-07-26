@@ -1,21 +1,39 @@
 """SQLite database initialization with WAL mode via aiosqlite."""
 
-import aiosqlite
+import asyncio
+import logging
 from pathlib import Path
 
+import aiosqlite
+
 from core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Serializes multi-statement write sequences on the shared connection so one
+# writer's commit cannot land in the middle of another writer's sequence.
+# (Single-user deployment: one process, low write volume.)
+DB_WRITE_LOCK = asyncio.Lock()
 
 
 async def init_database() -> aiosqlite.Connection:
     """Initialize SQLite database with WAL mode and create base tables."""
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
 
-    conn = await aiosqlite.connect(str(settings.sqlite_path))
+    try:
+        conn = await aiosqlite.connect(str(settings.sqlite_path))
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to open SQLite database at {settings.sqlite_path}: {e}"
+        ) from e
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA synchronous=NORMAL")
     await conn.execute("PRAGMA foreign_keys=ON")
+    await conn.execute("PRAGMA busy_timeout=5000")
 
     await _create_tables(conn)
+    await _migrate(conn)
     return conn
 
 
@@ -42,6 +60,7 @@ async def _create_tables(conn: aiosqlite.Connection):
             value TEXT NOT NULL,
             confidence REAL DEFAULT 1.0,
             chroma_id TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
             is_deleted INTEGER DEFAULT 0,
             last_accessed_at TEXT NOT NULL DEFAULT (datetime('now')),
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -60,6 +79,8 @@ async def _create_tables(conn: aiosqlite.Connection):
             new_value TEXT,
             timestamp TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        CREATE INDEX IF NOT EXISTS idx_changelog_memory ON memory_changelog(memory_id);
 
         -- Checkpoints
         CREATE TABLE IF NOT EXISTS checkpoints (
@@ -98,3 +119,15 @@ async def _create_tables(conn: aiosqlite.Connection):
 
     """)
     await conn.commit()
+
+
+async def _migrate(conn: aiosqlite.Connection):
+    """Additive migrations for databases created by older versions."""
+    async with conn.execute("PRAGMA table_info(memories)") as cur:
+        columns = {row["name"] for row in await cur.fetchall()}
+    if "metadata" not in columns:
+        logger.info("Migrating: adding memories.metadata column")
+        await conn.execute(
+            "ALTER TABLE memories ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'"
+        )
+        await conn.commit()

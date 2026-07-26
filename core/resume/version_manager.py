@@ -1,14 +1,14 @@
 """VersionManager — create, fork, diff, and manage resume versions.
 
-Copy-on-write semantics: forking a version references the parent's data
-until the first write, minimizing storage for versions that differ by only a few entries.
+Each version stores a full deep-copied snapshot as JSON under
+settings.versions_path (one file per version). Simple and robust for a
+single-user tool; no copy-on-write.
 """
 
 import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
 
 from core.config import settings
 from core.resume.schema import (
@@ -18,13 +18,25 @@ from core.resume.schema import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_dt(value) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            pass
+    return datetime.now()
+
+
 class VersionManager:
     """Manage multiple resume versions with forking and diffing."""
 
     def __init__(self, storage_dir: Path | None = None):
-        self._storage_dir = storage_dir or settings.uploads_path
+        self._storage_dir = storage_dir or settings.versions_path
         self._storage_dir.mkdir(parents=True, exist_ok=True)
         self._index: dict[str, ResumeVersion] = {}
+        self._migrate_legacy_files()
         self._load_index()
 
     # ── Public API ──────────────────────────────────────────
@@ -36,24 +48,23 @@ class VersionManager:
         notes: str = "",
         parent_id: str | None = None,
     ) -> ResumeVersion:
-        """Create a new version from resume data (or fork from parent)."""
+        """Create a new version snapshot from resume data."""
         version = ResumeVersion(
             parent_id=parent_id,
             name=name,
             notes=notes,
-            resume_data=resume_data,
+            resume_data=resume_data.model_copy(deep=True),
         )
         self._index[version.id] = version
         self._persist(version)
+        logger.info("Resume version created: %s (%s)", version.name, version.id)
         return version
 
     def fork_version(self, source_id: str, new_name: str, notes: str = "") -> ResumeVersion:
-        """Fork an existing version. Copy-on-write: shares parent data reference."""
+        """Fork an existing version into an independent copy."""
         source = self._get(source_id)
-        # Deep copy the resume data to create independent version
-        source_data = source.resume_data.model_copy(deep=True)
         return self.create_version(
-            resume_data=source_data,
+            resume_data=source.resume_data,
             name=new_name,
             notes=notes,
             parent_id=source.id,
@@ -64,7 +75,10 @@ class VersionManager:
         return self._get(version_id)
 
     def list_versions(self) -> list[dict]:
-        """List all versions with summary info."""
+        """List all versions with summary info, newest first."""
+        versions = sorted(
+            self._index.values(), key=lambda v: str(v.created_at), reverse=True
+        )
         return [
             {
                 "id": v.id,
@@ -80,25 +94,27 @@ class VersionManager:
                     "skills": len(v.resume_data.skills),
                 },
             }
-            for v in self._index.values()
+            for v in versions
         ]
 
     def update_version(self, version_id: str, resume_data: ResumeData) -> ResumeVersion:
         """Update the resume data of an existing version."""
         version = self._get(version_id)
-        version.resume_data = resume_data
+        version.resume_data = resume_data.model_copy(deep=True)
         version.updated_at = datetime.now()
         self._persist(version)
         return version
 
     def delete_version(self, version_id: str) -> bool:
-        """Delete a version. Removes from index and disk."""
+        """Delete a version; children keep existing but lose the parent link."""
         if version_id not in self._index:
             return False
         del self._index[version_id]
-        file_path = self._version_path(version_id)
-        if file_path.exists():
-            file_path.unlink()
+        self._version_path(version_id).unlink(missing_ok=True)
+        for child in self._index.values():
+            if child.parent_id == version_id:
+                child.parent_id = None
+                self._persist(child)
         return True
 
     def diff_versions(self, version_a_id: str, version_b_id: str) -> VersionDiff:
@@ -107,37 +123,28 @@ class VersionManager:
         b = self._get(version_b_id).resume_data
 
         diffs: list[EntryDiff] = []
-        sections = [
-            ("education", "education"),
-            ("work_experience", "work_experience"),
-            ("project_experience", "project_experience"),
-        ]
-
-        for section_key, label in sections:
+        for section_key in ("education", "work_experience", "project_experience"):
             a_entries = {e.id: e for e in getattr(a, section_key)}
             b_entries = {e.id: e for e in getattr(b, section_key)}
 
-            # Entries in B but not in A → added
             for eid, entry in b_entries.items():
                 if eid not in a_entries:
                     diffs.append(EntryDiff(
                         diff_type=DiffType.ADDED,
                         entry_id=eid,
-                        section=label,
-                        new_entry=entry.model_dump(),
+                        section=section_key,
+                        new_entry=entry.model_dump(mode="json"),
                     ))
 
-            # Entries in A but not in B → removed
             for eid, entry in a_entries.items():
                 if eid not in b_entries:
                     diffs.append(EntryDiff(
                         diff_type=DiffType.REMOVED,
                         entry_id=eid,
-                        section=label,
-                        old_entry=entry.model_dump(),
+                        section=section_key,
+                        old_entry=entry.model_dump(mode="json"),
                     ))
 
-            # Entries in both → check for modifications
             for eid in set(a_entries) & set(b_entries):
                 changed_fields = self._compare_entries(
                     a_entries[eid].model_dump(),
@@ -147,18 +154,19 @@ class VersionManager:
                     diffs.append(EntryDiff(
                         diff_type=DiffType.MODIFIED,
                         entry_id=eid,
-                        section=label,
-                        old_entry=a_entries[eid].model_dump(),
-                        new_entry=b_entries[eid].model_dump(),
+                        section=section_key,
+                        old_entry=a_entries[eid].model_dump(mode="json"),
+                        new_entry=b_entries[eid].model_dump(mode="json"),
                         changed_fields=changed_fields,
                     ))
 
-        # Also diff skills
+        # Skills diff by (name, category); level/years changes count as
+        # modified via the tuple including them would over-report — keep
+        # simple add/remove semantics, sorted for stable rendering.
         a_skills = {(s.name, s.category) for s in a.skills}
         b_skills = {(s.name, s.category) for s in b.skills}
-
-        added_skills = b_skills - a_skills
-        removed_skills = a_skills - b_skills
+        added_skills = sorted(b_skills - a_skills)
+        removed_skills = sorted(a_skills - b_skills)
 
         if added_skills:
             diffs.append(EntryDiff(
@@ -200,42 +208,55 @@ class VersionManager:
             "created_at": str(version.created_at),
             "updated_at": str(version.updated_at),
         }
-        file_path.write_text(
-            json.dumps(data, indent=2, default=str),
-            encoding="utf-8",
+        tmp_path = file_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            json.dumps(data, indent=2, default=str), encoding="utf-8"
         )
+        tmp_path.replace(file_path)
+
+    def _migrate_legacy_files(self):
+        """Move version_*.json out of uploads_path (they used to share it,
+        and the resume loader would mis-read them)."""
+        legacy_dir = settings.uploads_path
+        if not legacy_dir or legacy_dir == self._storage_dir or not legacy_dir.exists():
+            return
+        for old in legacy_dir.glob("version_*.json"):
+            target = self._storage_dir / old.name
+            try:
+                if not target.exists():
+                    old.replace(target)
+                else:
+                    old.unlink()
+                logger.info("Migrated legacy version file: %s", old.name)
+            except OSError as e:
+                logger.warning("Could not migrate %s: %s", old.name, e)
 
     def _load_index(self):
         """Load all persisted versions from disk."""
         for file_path in self._storage_dir.glob("version_*.json"):
             try:
                 data = json.loads(file_path.read_text(encoding="utf-8"))
-                resume_data = ResumeData(**data["resume_data"])
                 version = ResumeVersion(
                     id=data["id"],
                     parent_id=data.get("parent_id"),
                     name=data["name"],
                     notes=data.get("notes", ""),
-                    resume_data=resume_data,
-                    created_at=data.get("created_at", ""),
-                    updated_at=data.get("updated_at", ""),
+                    resume_data=ResumeData(**data["resume_data"]),
+                    created_at=_parse_dt(data.get("created_at")),
+                    updated_at=_parse_dt(data.get("updated_at")),
                 )
                 self._index[version.id] = version
             except Exception as e:
-                logger.warning(f"Failed to load version {file_path}: {e}")
+                logger.warning("Failed to load version %s: %s", file_path, e)
 
     @staticmethod
     def _compare_entries(a: dict, b: dict) -> list[str]:
         """Compare two entry dicts and return changed field names."""
         changed = []
         skip_keys = {"id", "entry_type", "confidence"}
-
         for key in set(a) | set(b):
             if key in skip_keys:
                 continue
-            va = a.get(key)
-            vb = b.get(key)
-            if json.dumps(va, default=str) != json.dumps(vb, default=str):
+            if json.dumps(a.get(key), default=str) != json.dumps(b.get(key), default=str):
                 changed.append(key)
-
-        return changed
+        return sorted(changed)

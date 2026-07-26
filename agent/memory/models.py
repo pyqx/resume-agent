@@ -25,12 +25,15 @@ class Memory:
     metadata: dict = field(default_factory=dict)
     chroma_id: str = ""
     is_deleted: bool = False
-    last_accessed_at: datetime = field(default_factory=datetime.now)
+    # SQLite returns TEXT timestamps; freshly-built objects carry datetime.
+    last_accessed_at: str | datetime | None = field(default_factory=datetime.now)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
 
     def to_text(self) -> str:
-        return f"[{self.type.value}] {self.key}: {self.value}"
+        """Embedding document. Content only — a type prefix would make all
+        same-type memories look artificially similar to the embedder."""
+        return f"{self.key}: {self.value}"
 
 
 @dataclass

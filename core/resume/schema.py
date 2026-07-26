@@ -61,6 +61,9 @@ class Education(BaseModel):
     level: EducationLevel = EducationLevel.BACHELOR
     start_date: date | None = None
     end_date: date | None = None
+    # True when the source only stated a year (dates were normalized to
+    # YYYY-01-01); gap/tenure heuristics must skip such entries.
+    dates_approximate: bool = False
     gpa: str = ""
     description: str = ""
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
@@ -73,6 +76,7 @@ class WorkExperience(BaseModel):
     position: str = ""
     start_date: date | None = None
     end_date: date | None = None
+    dates_approximate: bool = False
     is_current: bool = False
     location: str = ""
     bullets: list[str] = Field(default_factory=list)
@@ -88,6 +92,7 @@ class ProjectExperience(BaseModel):
     url: str = ""
     start_date: date | None = None
     end_date: date | None = None
+    dates_approximate: bool = False
     technologies: list[str] = Field(default_factory=list)
     bullets: list[str] = Field(default_factory=list)
     description: str = ""
@@ -101,6 +106,7 @@ class Skill(BaseModel):
     category: str = ""
     level: str = ""
     years: float = 0.0
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 # ── Top-level Resume Model ─────────────────────────────────
@@ -131,6 +137,7 @@ class ResumeData(BaseModel):
             "education": self.education,
             "work_experience": self.work_experience,
             "project_experience": self.project_experience,
+            "skills": self.skills,
         }
 
     def get_entry_by_id(self, entry_id: str):
@@ -161,6 +168,9 @@ class MatchLevel(str, Enum):
     FULL = "full"
     PARTIAL = "partial"
     NONE = "none"
+    # Scoring failed for this requirement (LLM error) — distinct from a
+    # genuine "not met" so the UI can say "couldn't evaluate".
+    ERROR = "error"
 
 
 class Requirement(BaseModel):
@@ -199,6 +209,8 @@ class MatchReport(BaseModel):
     requirements: list[Requirement] = Field(default_factory=list)
     signals: list[JDSignal] = Field(default_factory=list)
     keyword_coverage: float = 0.0
+    # Number of requirements whose scoring failed (match_level == "error").
+    scoring_errors: int = 0
     created_at: datetime = Field(default_factory=datetime.now)
 
 

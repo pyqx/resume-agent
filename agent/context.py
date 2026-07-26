@@ -1,13 +1,16 @@
-"""ContextAssembler — builds the full reasoning context for each Agent loop iteration."""
+"""ContextAssembler — builds the full reasoning context for each Agent planning round."""
 
-import json
 import logging
 
 from agent.memory.retriever import MemoryRetriever
 from agent.tools.registry import ToolRegistry
-from core.config import settings
+from core.llm import render_prompt, UNTRUSTED_NOTE
 
 logger = logging.getLogger(__name__)
+
+# Length caps keep the system prompt bounded as memories/resumes grow.
+_RESUME_CONTEXT_MAX = 3000
+_MEMORY_SECTION_MAX = 1500
 
 SYSTEM_PROMPT = """You are a senior resume consultant with deep expertise in recruitment across industries.
 
@@ -21,6 +24,10 @@ you are a career narrative advisor who understands how recruiters and ATS system
 3. **User has final say**: You suggest, the user decides. Never change facts, only optimize presentation.
 4. **STAR completeness**: Every experience entry should cover Situation, Task, Action, Result.
 5. **Quantify when possible**: Numbers, percentages, scales — they make claims credible.
+6. **Respond in the user's language** (Chinese users get Chinese responses).
+
+## Security
+{untrusted_note}
 
 ## Working Context
 - User Profile from Memory: {user_profile}
@@ -39,7 +46,12 @@ Always end your turn by either asking the user a question or presenting a result
 
 
 class ContextAssembler:
-    """Assembles the complete context for each Agent planning cycle."""
+    """Assembles the complete context for each Agent planning round.
+
+    assemble() is called before every PLAN phase (not once per request), so
+    tool availability and memory reflect state changes made by earlier
+    rounds in the same request.
+    """
 
     def __init__(self, retriever: MemoryRetriever, tool_registry: ToolRegistry):
         self._retriever = retriever
@@ -52,75 +64,65 @@ class ContextAssembler:
         user_id: str = "default",
         working_state: dict | None = None,
     ) -> dict:
-        """Build the full context dict for the current Agent turn.
+        """Build the full context dict for the current planning round."""
+        working_state = working_state or {}
 
-        Returns:
-            dict with keys: system_prompt, user_message, memory_context,
-                           working_state, tool_manifest, available_tools
-        """
-        # Retrieve relevant memories
-        memory_context = await self._retriever.get_relevant_context(
-            user_message=user_message,
-            user_id=user_id,
-        )
+        # Memory is auxiliary context — a broken/absent vector store must
+        # never take down the chat endpoint.
+        try:
+            memory_context = await self._retriever.get_relevant_context(
+                user_message=user_message,
+                user_id=user_id,
+                session_id=session_id,
+            )
+        except TypeError:
+            # Older retriever signature without session_id
+            try:
+                memory_context = await self._retriever.get_relevant_context(
+                    user_message=user_message, user_id=user_id
+                )
+            except Exception as e:
+                logger.warning("Memory retrieval failed: %s", e)
+                memory_context = {}
+        except Exception as e:
+            logger.warning("Memory retrieval failed: %s", e)
+            memory_context = {}
 
-        # Build tool manifest
         context_for_tools = {
-            "resume_loaded": (working_state or {}).get("resume_loaded", False),
-            "github_url": (working_state or {}).get("github_url"),
-            "jd_loaded": (working_state or {}).get("jd_loaded", False),
-            "sanitization_configured": (working_state or {}).get("sanitization_configured", False),
+            "resume_loaded": working_state.get("resume_loaded", False),
+            "github_url": working_state.get("github_url"),
+            "jd_loaded": working_state.get("jd_loaded", False),
         }
         tool_manifest_text = self._tool_registry.get_llm_manifest_text(context_for_tools)
         available_tools = self._tool_registry.get_manifest(context_for_tools)
 
-        # Format memory context for prompt
-        user_profile = "\n".join(
-            f"- {m.key}: {m.value}"
-            for m in memory_context.get("user_profile", [])
-        ) or "No profile data yet."
+        def _mem_lines(key: str, fallback: str, with_confidence: bool = False) -> str:
+            items = memory_context.get(key, [])
+            if not items:
+                return fallback
+            if with_confidence:
+                lines = [f"- {m.key}: {m.value} (confidence: {m.confidence:.1f})" for m in items]
+            else:
+                lines = [f"- {m.key}: {m.value}" for m in items]
+            return "\n".join(lines)[:_MEMORY_SECTION_MAX]
 
-        preferences = "\n".join(
-            f"- {m.key}: {m.value} (confidence: {m.confidence:.1f})"
-            for m in memory_context.get("preference", [])
-        ) or "No preferences recorded."
-
-        session_ctx = "\n".join(
-            f"- {m.key}: {m.value}"
-            for m in memory_context.get("session", [])
-        ) or "No session context."
-
-        feedback = "\n".join(
-            f"- {m.key}: {m.value}"
-            for m in memory_context.get("feedback", [])
-        ) or "No feedback history."
-
-        # Extract resume context from working_state
-        resume_context = (working_state or {}).get(
+        resume_context = working_state.get(
             "resume_summary",
-            "No resume loaded. Ask the user to upload one if needed."
-        )
+            "No resume loaded. Ask the user to upload one if needed.",
+        )[:_RESUME_CONTEXT_MAX]
 
-        # Assemble system prompt (escape curly braces from user content)
-        def _escape(v: str) -> str:
-            return v.replace("{", "{{").replace("}", "}}") if isinstance(v, str) else v
-
-        system_prompt = SYSTEM_PROMPT.format(
-            user_profile=_escape(user_profile),
-            preferences=_escape(preferences),
-            session_context=_escape(session_ctx),
-            feedback_history=_escape(feedback),
-            resume_context=_escape(resume_context),
-            tool_manifest=_escape(tool_manifest_text),
+        system_prompt = render_prompt(
+            SYSTEM_PROMPT,
+            untrusted_note=UNTRUSTED_NOTE,
+            user_profile=_mem_lines("user_profile", "No profile data yet."),
+            preferences=_mem_lines("preference", "No preferences recorded.", with_confidence=True),
+            session_context=_mem_lines("session", "No session context."),
+            feedback_history=_mem_lines("feedback", "No feedback history."),
+            resume_context=resume_context,
+            tool_manifest=tool_manifest_text,
         )
 
         return {
             "system_prompt": system_prompt,
-            "user_message": user_message,
-            "memory_context": memory_context,
-            "working_state": working_state or {},
-            "tool_manifest_text": tool_manifest_text,
             "available_tools": available_tools,
-            "session_id": session_id,
-            "user_id": user_id,
         }

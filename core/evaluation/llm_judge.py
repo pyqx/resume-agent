@@ -1,46 +1,92 @@
 """LLMJudge — LLM-as-Judge for semantic quality evaluation of resume content."""
 
-import json
 import logging
 
-from core.llm import get_llm_client_from_settings
-
-from core.config import settings
+from core.evaluation.render import resume_to_text
+from core.llm import (
+    UNTRUSTED_NOTE,
+    get_llm_client_from_settings,
+    parse_json_response,
+    render_prompt,
+    wrap_untrusted,
+)
 from core.resume.schema import ResumeData
 
 logger = logging.getLogger(__name__)
 
-JUDGE_PROMPT = """You are a resume quality evaluator. Score the following resume across five dimensions on a 1-10 scale.
+# Dimension weights (mirrors prompts/evaluation/llm_judge_v1.yaml). The
+# overall score is always computed in Python from these weights — a
+# model-reported total is never trusted.
+DIMENSION_WEIGHTS: dict[str, float] = {
+    "star_completeness": 0.35,
+    "quantitative_density": 0.30,
+    "terminology_accuracy": 0.15,
+    "conciseness": 0.10,
+    "narrative_coherence": 0.10,
+}
 
-Resume Content:
+_MAX_RESUME_CHARS = 8000
+_DEFAULT_DIMENSION_SCORE = 5.0
+
+JUDGE_SYSTEM = (
+    "You are a strict but constructive resume quality evaluator. "
+    "Follow the scoring rubric exactly and output only JSON. " + UNTRUSTED_NOTE
+)
+
+# Rubric merged from prompts/evaluation/llm_judge_v1.yaml (v1.0).
+JUDGE_PROMPT = """Score the resume below across five dimensions on a 1-10 scale.
+
 {resume_text}
 
-Score each dimension:
-1. **star_completeness** (1-10): Do experience entries include Situation, Task, Action, and Result? Are the four elements clearly present?
-2. **quantitative_density** (1-10): How many entries include specific numbers, percentages, or measurable outcomes?
-3. **terminology_accuracy** (1-10): Are technical terms spelled correctly? Are industry terms used appropriately?
-4. **conciseness** (1-10): Is the writing tight and impactful? No filler words or redundant statements?
-5. **narrative_coherence** (1-10): Does the resume tell a clear career story? Is there a logical progression across experiences?
+Dimensions and scoring rubric:
 
-Also provide:
-- 2-3 specific, actionable suggestions to improve the lowest-scoring dimensions
-- An overall score (weighted: STAR*0.35 + Quant*0.30 + Term*0.15 + Concise*0.10 + Coherence*0.10)
+1. star_completeness — Do experience entries include Situation, Task, Action, and Result?
+   1-3: Most entries describe only what was done (Action), missing context and results
+   4-6: Some entries have STAR elements but inconsistently applied
+   7-8: Most entries have 3+ STAR elements clearly present
+   9-10: Every entry has full STAR with specific details in each dimension
 
-Output JSON:
-{{
-  "dimensions": {{
+2. quantitative_density — How many entries include specific numbers, percentages, or measurable outcomes?
+   1-3: Almost no numbers or measurable outcomes
+   4-6: Some numbers present but vague (e.g. 'many', 'several')
+   7-8: Most entries have at least one specific metric
+   9-10: Every claim is backed by a specific number or percentage
+
+3. terminology_accuracy — Are technical terms spelled correctly and used appropriately?
+   1-3: Major errors in tech stack naming or industry terminology
+   4-6: Minor inconsistencies in term usage
+   7-8: Terms are correct, occasionally missing context
+   9-10: All terms are precisely used with correct context
+
+4. conciseness — Is the writing tight and impactful? No filler words?
+   1-3: Wordy, repetitive, or filled with meaningless phrases
+   4-6: Some filler but generally readable
+   7-8: Clean writing with few redundancies
+   9-10: Every word pulls its weight, maximum impact per sentence
+
+5. narrative_coherence — Does the resume tell a clear career story with logical progression?
+   1-3: Disjointed experiences with no clear career narrative
+   4-6: Some progression visible but not clearly articulated
+   7-8: Clear career arc with logical progression between roles
+   9-10: Compelling narrative that positions each experience as a stepping stone
+
+Guidelines:
+- Always include 2-3 specific, actionable suggestions targeting the lowest-scoring dimensions
+- Cite specific examples from the resume text
+- Be constructive — focus on what can be improved, not what's wrong
+
+Output JSON only:
+{
+  "dimensions": {
     "star_completeness": 0,
     "quantitative_density": 0,
     "terminology_accuracy": 0,
     "conciseness": 0,
     "narrative_coherence": 0
-  }},
-  "overall_score": 0.0,
+  },
   "suggestions": ["suggestion 1", "suggestion 2", "suggestion 3"],
   "strengths": ["strength 1", "strength 2"]
-}}
-
-Output ONLY valid JSON:"""
+}"""
 
 
 class LLMJudge:
@@ -56,82 +102,74 @@ class LLMJudge:
         return self._llm
 
     async def evaluate(self, resume: ResumeData) -> dict:
-        """Evaluate resume quality across five dimensions."""
-        resume_text = self._resume_to_text(resume)
+        """Evaluate resume quality across five dimensions.
+
+        Returns ``{"available": True, "dimensions": {...}, "overall_score": ...,
+        "suggestions": [...], "strengths": [...]}`` on success, plus
+        ``"parse_warnings"`` when a dimension had to be defaulted.
+
+        On failure returns ``{"available": False, "error": "..."}`` — never a
+        fabricated mid-scale score.
+        """
+        resume_text = resume_to_text(resume)[:_MAX_RESUME_CHARS]
+        prompt = render_prompt(
+            JUDGE_PROMPT,
+            resume_text=wrap_untrusted(resume_text, "resume"),
+        )
 
         try:
-            response = self.llm.messages.create(
-                model=settings.llm_model,
+            response = await self.llm.messages.create(
+                messages=[{"role": "user", "content": prompt}],
+                system=JUDGE_SYSTEM,
                 max_tokens=2048,
                 temperature=0.0,
-                messages=[{
-                    "role": "user",
-                    "content": JUDGE_PROMPT.format(
-                    resume_text=resume_text[:8000].replace("{", "{{").replace("}", "}}")
-                ),
-                }],
+                expect_json=True,
             )
-
-            content = self._extract_text(response)
-            result = json.loads(self._clean_json(content))
-            return result
-
+            data = parse_json_response(response)
+            if not isinstance(data, dict):
+                raise ValueError("judge response is not a JSON object")
         except Exception as e:
-            logger.warning(f"LLM judge evaluation failed: {e}")
-            return {
-                "dimensions": {
-                    "star_completeness": 5,
-                    "quantitative_density": 5,
-                    "terminology_accuracy": 5,
-                    "conciseness": 5,
-                    "narrative_coherence": 5,
-                },
-                "overall_score": 5.0,
-                "suggestions": ["LLM evaluation unavailable. Review resume manually."],
-                "strengths": [],
-                "error": str(e),
-            }
+            logger.warning("LLM judge evaluation failed: %s", e)
+            return {"available": False, "error": f"{type(e).__name__}: {e}"[:300]}
 
-    def _resume_to_text(self, resume: ResumeData) -> str:
-        """Convert ResumeData to a flat text representation for evaluation."""
-        parts = []
-
-        if resume.personal_info.summary:
-            parts.append(f"Summary: {resume.personal_info.summary}")
-
-        for edu in resume.education:
-            parts.append(f"Education: {edu.degree} {edu.major} @ {edu.school}")
-
-        for work in resume.work_experience:
-            parts.append(f"\nWork: {work.position} @ {work.company}")
-            for bullet in work.bullets:
-                parts.append(f"  - {bullet}")
-            if work.description:
-                parts.append(f"  {work.description}")
-
-        for proj in resume.project_experience:
-            parts.append(f"\nProject: {proj.name} ({proj.role})")
-            parts.append(f"  Tech: {', '.join(proj.technologies)}")
-            for bullet in proj.bullets:
-                parts.append(f"  - {bullet}")
-
-        if resume.skills:
-            skills_text = ", ".join(f"{s.name}({s.years}y)" for s in resume.skills)
-            parts.append(f"\nSkills: {skills_text}")
-
-        return "\n".join(parts)
+        return self._build_result(data)
 
     @staticmethod
-    def _extract_text(response) -> str:
-        for block in response.content:
-            if hasattr(block, "text"):
-                return block.text
-        return str(response.content)
+    def _build_result(data: dict) -> dict:
+        raw_dims = data.get("dimensions")
+        if not isinstance(raw_dims, dict):
+            raw_dims = {}
 
-    @staticmethod
-    def _clean_json(text: str) -> str:
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1])
-        return text
+        parse_warnings: list[str] = []
+        dimensions: dict[str, float] = {}
+        for name in DIMENSION_WEIGHTS:
+            raw = raw_dims.get(name)
+            try:
+                value = float(raw)
+                if value != value:  # NaN
+                    raise ValueError("NaN")
+            except (TypeError, ValueError):
+                parse_warnings.append(
+                    f"dimension '{name}' was {raw!r}; defaulted to {_DEFAULT_DIMENSION_SCORE}"
+                )
+                value = _DEFAULT_DIMENSION_SCORE
+            dimensions[name] = min(10.0, max(0.0, value))
+
+        # Weighted total computed here, not by the model.
+        overall = round(
+            sum(dimensions[name] * weight for name, weight in DIMENSION_WEIGHTS.items()),
+            1,
+        )
+
+        suggestions = data.get("suggestions")
+        strengths = data.get("strengths")
+        result = {
+            "available": True,
+            "dimensions": dimensions,
+            "overall_score": overall,
+            "suggestions": [str(s) for s in suggestions if s] if isinstance(suggestions, list) else [],
+            "strengths": [str(s) for s in strengths if s] if isinstance(strengths, list) else [],
+        }
+        if parse_warnings:
+            result["parse_warnings"] = parse_warnings
+        return result

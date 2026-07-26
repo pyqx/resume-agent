@@ -21,143 +21,80 @@
 
 ## 📖 项目简介
 
-**Resume Agent** 是一个全栈 AI 简历助手，核心采用**单 Agent 深度推理循环**（规划 → 执行 → 观察 → 再规划），能够自主调用工具、评估结果并自我修正。专为**中文求职市场**设计，完整支持中文简历解析、JD 匹配和面试准备。
+**Resume Agent** 是一个本地优先的全栈 AI 简历助手,核心是一个**单 Agent 推理循环**(规划 → 执行 → 观察 → 再规划),能够自主调用工具、评估结果并自我修正。专为**中文求职市场**设计,完整支持中文简历解析、JD 匹配和面试准备。
 
-核心能力：上传简历后，可以针对目标岗位进行匹配分析、挖掘简历短板、生成面试题目和自我介绍，并支持将分析结果导出为 Markdown 或 PDF。
+上传简历后,可以针对目标岗位做匹配分析、挖掘简历短板、生成面试题目和自我介绍,分析 GitHub 项目并生成 STAR 格式的简历条目,并将结果导出为 Markdown 或 PDF。
+
+> 定位:**单用户本地工具**。后端默认只绑定 127.0.0.1,不含多用户鉴权;请勿直接暴露到公网。
 
 ---
 
 ## ✨ 功能特性
 
 ### 1. 📄 简历解析与管理
-- 上传 **PDF、DOCX、Markdown** 格式简历
-- 多策略解析：PyMuPDF（PDF）、python-docx（DOCX）、纯文本（MD）
-- LLM 驱动结构化提取，字段附带置信度评分
-- 简历列表管理、删除、重新加载
-- 调试解析接口，分步查看提取中间结果
+- 上传 **PDF、DOCX、Markdown/TXT** 简历(上限 10MB,文件名安全化处理)
+- 多策略解析:PyMuPDF(PDF,含双栏检测与线性化)、python-docx(DOCX)、纯文本
+- LLM 结构化提取 + 三级 JSON 容错(提取 → 修复 → 清洗重试),失败降级为规则抽取(置信度会相应降低)
+- 字段附带置信度;仅有年份的日期会标记为"约",避免下游误判空窗期
+- 简历列表 / 删除 / 重新加载;当前选中简历跨重启保持
 
 ### 2. 🎯 JD 匹配与分析
-- 粘贴职位描述 → 结构化提取硬性要求、加分项、关键词频率
-- **两阶段匹配**：向量召回（低成本）→ LLM 重排序（高精度）
-- 逐条要求匹配度评分（满足 / 部分满足 / 未满足），附证据与改进建议
-- **JD 隐性信号检测**：危险短语、文化倾向、紧急程度提示
-- 匹配结果可视化：评分环图、匹配明细、信号解读卡片
+- 粘贴职位描述 → LLM 结构化提取硬性要求、加分项、关键词频率
+- **逐条要求 LLM 评分**(有界并发):满足 / 部分满足(计半分)/ 未满足 / 无法评估,附证据与改进建议;单条评分失败会明确标记而不是静默计 0
+- 关键词覆盖率:分词 + 词边界匹配(中文子串匹配),不再有 "go 命中 google" 式误报
+- **JD 隐性信号检测**:22 条规则(含 996、大小周、奋斗者、抗压等中文信号),支持否定语抑制("不加班"不报警)
+- 匹配结果缓存(按简历内容 + JD 指纹),重复分析秒回
 
-### 3. 🧠 内容深度优化（通过 Agent 对话）
-- STAR 完整性分析
-- 弱动词检测与替换建议
-- 量化密度建议
-- **规则 + LLM 双轨评估** — 规则引擎毫秒级捕获常见问题，LLM 处理深层语义
-- ATS 兼容性模拟检查
+### 3. 🧠 内容质量评估(通过 Agent 对话)
+- 规则引擎:弱动词(扣分封顶)、敏感信息、页数、中英文空格、日期一致性、技术名词大小写 —— 全部基于真实渲染文本
+- LLM 五维评分(STAR 完整性 / 量化密度 / 术语准确性 / 简洁性 / 叙事连贯),带分档 rubric,加权总分在服务端计算
+- ATS 模拟:关键字段可提取性 + 格式检查 + 关键词覆盖
+- LLM 不可用时明确降级(权重重归一),**不会返回假分数**
 
 ### 4. 💻 GitHub 项目分析
-- 提交 GitHub 仓库 URL → **五阶段渐进式 SSE 分析**：
-  1. 仓库元数据获取
-  2. 目录结构分析
-  3. 依赖与 Issue/PR 深度分析
-  4. 个人发展方向与改进建议（LLM 生成）
-  5. 准备就绪 → 按需生成 **STAR 格式简历条目**
-- SSE 实时流式推送，每阶段结果逐步呈现
+- 提交仓库 URL(支持 GitHub/GitLab/Gitee)→ **五阶段渐进式 SSE 分析**:
+  1. 仓库元数据(支持 `GITHUB_TOKEN`,限流时明确提示而非返回假数据)
+  2. 目录结构与技术栈(单次浅克隆,阶段间复用;凭据隔离;敏感文件排除)
+  3. 依赖清单(tomllib 真实解析)+ Issue 机会扫描(过滤 PR,并行请求)
+  4. 个性化改进建议(结合简历的目标岗位)
+  5. 按需生成 **STAR 格式简历条目**
+- 阶段结果缓存;任何阶段失败都会推送明确的 error 事件
 
 ### 5. 🗣 面试准备
-- **面试问题生成** — 4 类题目：STAR 深挖追问、技术深度追问、行为面试题、压力测试题，附带公司针对性建议
-- **自我介绍脚本** — 根据简历 + 目标岗位定制短版（60s）和长版（180s）
-- **简历弱点分析** — 检测简历中的短板，生成风险评级与应对策略（含参考话术）
-- 支持导出为 **Markdown / PDF**
+- **面试问题生成**:STAR 深挖 / 技术追问 / 行为面 / 压力测试;提供 JD 时按岗位定向出题
+- **自我介绍脚本**:短版(约 200 字)与长版(约 500 字),附核心信息点与表达技巧
+- **简历弱点分析**:规则检测(空窗期 / 频繁跳槽 / 无量化成果 / 当前任期过短 / 无教育经历)+ LLM 生成诚实的应对话术;规则零命中时仍会做一次内容质量审查;近似日期不会制造假空窗
+- 导出 Markdown / PDF(内置中文字体)
 
 ### 6. 🔄 智能聊天 Agent
-- 类 LangGraph **Plan→Act→Observe→Replan** 推理循环
-- SSE 流式实时响应，推理过程逐步展示
-- 工具调用：简历 CRUD、JD 匹配、网络搜索、质量评估
-- 会话历史管理（保存/加载/自动续期）
+- Plan→Act→Observe→Replan 推理循环(手写状态机),SSE 流式推送推理过程
+- **33 个已注册工具**:简历读改增删、版本管理、JD 解析/匹配/信号/关键词、GitHub 五阶段、面试三件套、质量评估、记忆读写、网页搜索/抓取
+- 工具权限强制执行:前置条件在执行时校验;删除类工具必须显式确认(`confirm=true`)
+- 长期记忆:对话结束后自动提取用户事实(目标岗位、偏好、反馈),跨会话生效;后台定期去重合并
+- 崩溃恢复:意外中断的会话可从检查点恢复已完成的工具调用记录
+- 会话历史持久化(SQLite),多轮上下文注入
 
 ### 7. 📤 导出
-- 简历导出为 **Markdown、HTML、PDF**
-- 面试内容（问题、自我介绍、弱点分析）导出为 Markdown / PDF
-- PDF 导出基于 PyMuPDF 内置中文字体，无需额外字库
+- 简历导出 Markdown / HTML(已做 XSS 转义)/ PDF
+- 面试内容导出 Markdown / PDF;PDF 基于 PyMuPDF 内置中文字体,按实际字宽折行
+
+### 8. 🖥 前端界面
+- **聊天首页**:推理链可视化(计划 → 工具调用 → 结果逐步展示)、停止生成、Markdown 渲染、会话跨页/刷新续接
+- **JD 匹配页**:评分环、逐条明细("无法评估"态明确标注)、隐性信号卡、缺失关键词提示
+- **面试准备页**:三类内容生成、JD 定向出题、一键复制、带时间戳的 Markdown/PDF 导出
+- **GitHub 分析页**:五阶段渐进展示、限流提示、建议卡片(难度/工时/简历影响)、STAR 条目生成与复制
+- **简历面板**:条目在线编辑/删除(带确认)、版本快照与字段级差异对比、导出工具栏;近似日期标注"(约)"
 
 ---
 
-## 🏗 系统架构
+## 🔐 隐私与安全
 
-```
-┌──────────────────────────────────────────────────────┐
-│                    前端 (Next.js 14)                    │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────────┐   │
-│  │ 聊天首页  │  │ JD 匹配  │  │ 面试准备          │   │
-│  │ (SSE)    │  │ 页面     │  │ 页面              │   │
-│  └────┬─────┘  └────┬─────┘  └───────┬───────────┘   │
-│       │              │                │               │
-│       └──────────────┴────────────────┘               │
-│                       │ API 客户端 (/lib/api.ts)       │
-└───────────────────────┼──────────────────────────────┘
-                        │ HTTP / SSE
-┌───────────────────────┼──────────────────────────────┐
-│             后端 (FastAPI, Python 3.11+)               │
-│  ┌──────────────────────────────────────────────────┐ │
-│  │              API 层 (api/routes/)                  │ │
-│  │  /chat  /resume  /jd  /export  /github  /interview│ │
-│  └──────────────────────┬───────────────────────────┘ │
-│                         │                              │
-│  ┌──────────────────────┴───────────────────────────┐ │
-│  │              Agent 核心 (agent/)                   │ │
-│  │  ┌──────────┐  ┌──────────┐  ┌────────────────┐  │ │
-│  │  │ 规划器    │  │  循环    │  │  上下文         │  │ │
-│  │  │ (双层)   │  │(P→A→O→R) │  │  组装器         │  │ │
-│  │  └──────────┘  └────┬─────┘  └────────┬───────┘  │ │
-│  │                     │                  │           │ │
-│  │  ┌──────────────────┴──────────────────┴────────┐ │ │
-│  │  │           工具系统 (agent/tools/)              │ │ │
-│  │  │  简历 ｜ JD ｜ GitHub ｜ 面试 ｜ 网页 ｜ ...  │ │ │
-│  │  └──────────────────────┬───────────────────────┘ │ │
-│  │                         │                          │ │
-│  │  ┌──────────────────────┴───────────────────────┐ │ │
-│  │  │          记忆系统 (agent/memory/)              │ │ │
-│  │  │  ChromaDB (向量)  +  SQLite (元数据)          │ │ │
-│  │  └──────────────────────┬───────────────────────┘ │ │
-│  │                         │                          │ │
-│  │  ┌──────────────────────┴───────────────────────┐ │ │
-│  │  │          核心逻辑 (core/)                      │ │ │
-│  │  │  简历 ｜ JD ｜ 面试 ｜ GitHub ｜ 评估 ｜ 缓存 │ │ │
-│  │  └──────────────────────────────────────────────┘ │ │
-│  └──────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────┘
-```
-
-### Agent 循环流程
-
-```
-                    ┌─────────┐
-                    │  开始   │
-                    └────┬────┘
-                         ▼
-              ┌─────────────────────┐
-         ┌───│ 规划: 接下来做什么?  │
-         │   │ (回复 / 追问 /       │
-         │   │  调用工具)           │
-         │   └──────────┬──────────┘
-         │              ▼
-         │   ┌─────────────────────┐
-         │   │ 执行: 运行工具       │◄──── 指数退避
-         │   │ (并行、重试)         │      重试
-         │   └──────────┬──────────┘
-         │              ▼
-         │   ┌─────────────────────┐
-         │   │ 观察: 评估结果       │
-         │   │ (成功 / 部分成功    │
-         │   │  / 失败)            │
-         │   └──────────┬──────────┘
-         │              │
-         │    ┌─────────┴──────────┐
-         │    ▼                    ▼
-         │ 还需继续?        任务完成
-         │                  或需用户?
-         │    │                    │
-         └────┘                    ▼
-                           ┌─────────────┐
-                           │ 输出 / 结束  │
-                           └─────────────┘
-```
+- **PII 可逆掩码**:手机号、邮箱、身份证、薪资、微信在**发送给 LLM 前**替换为占位符,响应后自动还原(`SANITIZE_PII` 可关);日志层同样有不可逆脱敏过滤器
+- **本地优先**:SQLite + 嵌入式 ChromaDB + 磁盘缓存,仅 LLM API 调用出网
+- **SSRF 防护**:网页抓取工具拦截内网/回环/云元数据地址,重定向逐跳校验,响应体限 2MB
+- **仓库克隆隔离**:禁用凭据助手与终端提示,私有仓库快速失败;`.env`/密钥类文件不进入分析
+- **提示词注入防护**:简历、JD、GitHub 内容以不可信数据标记包裹,系统提示明确拒绝执行内容内指令
+- 调试端点默认关闭(`DEBUG_ENDPOINTS=false`)
 
 ---
 
@@ -165,15 +102,14 @@
 
 | 层级 | 技术 | 用途 |
 |------|------|------|
-| **框架** | FastAPI + Uvicorn | 异步 Python 后端，支持 SSE 流式 |
-| **Agent** | 自定义 LangGraph 风格循环 | Plan→Act→Observe→Replan 编排 |
-| **LLM** | Anthropic Claude / OpenAI 兼容 | 统一客户端，支持多供应商 |
-| **向量库** | ChromaDB（嵌入式） | 语义记忆和 JD/简历向量检索 |
-| **数据库** | SQLite（WAL 模式） | 元数据、会话、检查点持久化 |
-| **缓存** | diskcache | LLM 响应缓存（降低延迟与成本） |
-| **文档解析** | PyMuPDF、python-docx | PDF/DOCX 简历文本提取 |
-| **前端** | Next.js 14 + React 18 + Tailwind CSS | 现代混合渲染 UI |
-| **流式** | Server-Sent Events (SSE) | 实时 Agent 响应与多阶段分析推送 |
+| **框架** | FastAPI + Uvicorn | 异步后端,SSE 流式 |
+| **Agent** | 自定义状态机循环 | Plan→Act→Observe→Replan 编排 |
+| **LLM** | Anthropic / OpenAI 兼容(DeepSeek 等) | 统一异步客户端:超时、退避重试、PII 掩码、JSON 提取 |
+| **向量库** | ChromaDB(嵌入式) | 语义记忆检索 |
+| **数据库** | SQLite(WAL) | 会话、消息、记忆元数据、检查点(简历与版本为本地 JSON 文件) |
+| **缓存** | diskcache | 匹配报告与 GitHub 分析缓存 |
+| **文档解析** | PyMuPDF、python-docx | PDF/DOCX 文本提取 |
+| **前端** | Next.js 14 + React 18 + Tailwind | 聊天 / 匹配 / 面试 / GitHub 分析页面 |
 
 ---
 
@@ -181,61 +117,43 @@
 
 ### 环境要求
 
-- **Python 3.11+**
-- **Node.js 18+**（前端）
+- **Python 3.11+**、**Node.js 18+**、git(GitHub 分析功能需要)
 
 ### 后端启动
 
 ```bash
-# 1. 克隆仓库
-git clone https://github.com/pyqx/resume-agent.git && cd resume-agent
-
-# 2. 创建虚拟环境
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Linux/Mac:
-# source .venv/bin/activate
-
-# 3. 安装 Python 依赖
+# 1. 安装依赖
 pip install -e ".[dev]"
 
-# 4. 配置环境变量
-# 编辑 .env 文件，设置 LLM 供应商和 API Key
+# 2. 配置环境变量
+cp .env.example .env   # 编辑 .env,填入 LLM_API_KEY 等
 
-# 5. 初始化数据库
-python -c "from core.database import init_db; import asyncio; asyncio.run(init_db())"
-
-# 6. 启动后端服务
-uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+# 3. 启动(数据库自动初始化与迁移)
+uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
 ### 前端启动
 
 ```bash
-# 1. 进入前端目录
 cd frontend
-
-# 2. 安装依赖
 npm install
-
-# 3. 启动开发服务器
 npm run dev
 ```
 
-前端运行在 **http://localhost:3000**，API 请求自动代理到 **http://localhost:8000**。
+前端 **http://localhost:3000**,API 自动代理到后端;后端地址可用 `NEXT_PUBLIC_API_BASE` 覆盖。
 
-### 环境变量
+### 环境变量(完整清单见 `.env.example`)
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `LLM_PROVIDER` | `openai_compatible` | `anthropic` 或 `openai_compatible` |
-| `LLM_API_KEY` | — | LLM API 密钥 |
-| `LLM_MODEL` | `deepseek-v4-flash` | 模型名称 |
-| `LLM_BASE_URL` | `https://api.deepseek.com` | API 地址（OpenAI 兼容模式） |
-| `HOST` | `127.0.0.1` | 后端绑定地址 |
-| `PORT` | `8000` | 后端端口 |
-| `CORS_ORIGINS` | `["http://localhost:3000"]` | 允许的 CORS 来源 |
+| `LLM_PROVIDER` | `anthropic` | `anthropic` 或 `openai_compatible` |
+| `LLM_API_KEY` | — | LLM API 密钥(必填) |
+| `LLM_MODEL` | `claude-sonnet-4-6` | 模型名称 |
+| `LLM_BASE_URL` | — | OpenAI 兼容模式的 API 地址 |
+| `SANITIZE_PII` | `true` | LLM 出站 PII 掩码开关 |
+| `GITHUB_TOKEN` | — | 可选;不设则受 60 次/小时限流 |
+| `DEBUG_ENDPOINTS` | `false` | 调试解析端点开关 |
+| `MAX_UPLOAD_SIZE_MB` | `10` | 上传大小限制 |
 
 ---
 
@@ -243,107 +161,39 @@ npm run dev
 
 ```
 resume-agent/
-├── agent/                    # Agent 核心（"大脑"）
-│   ├── loop.py               # 主 P→A→O→R 循环（状态机）
-│   ├── planner.py            # 战略 + 战术双层规划器
-│   ├── context.py            # 上下文组装器
-│   ├── checkpoint.py         # 容错检查点
-│   ├── memory/               # ChromaDB + SQLite 记忆系统
-│   │   ├── extractor.py      # LLM 事实提取
-│   │   ├── consolidator.py   # 去重与冲突检测
-│   │   ├── retriever.py      # 语义检索
-│   │   ├── store.py          # 双写存储
-│   │   └── models.py         # 数据模型
-│   └── tools/                # 工具系统
-│       ├── registry.py       # 注册中心
-│       ├── resume_tools.py   # 简历 CRUD
-│       ├── jd_tools.py       # JD 匹配
-│       ├── interview_tools.py
-│       ├── github_tools.py   # GitHub 5 阶段分析
-│       ├── web_tools.py      # 网页搜索/抓取
-│       ├── memory_tools.py   # 记忆读写
-│       ├── quality_tools.py  # 质量评估
-│       └── base.py           # 基类
-├── api/                      # FastAPI 后端
-│   ├── main.py               # 入口、中间件、路由注册
-│   ├── deps.py               # 依赖注入
-│   ├── session_manager.py    # 会话持久化
-│   ├── middleware/            # CORS / 日志 / 隐私脱敏
-│   └── routes/
-│       ├── chat.py           # SSE 流式聊天
-│       ├── resume.py         # 简历 CRUD + 上传 + 解析
-│       ├── jd.py             # JD 解析、匹配、信号
-│       ├── export.py         # Markdown/HTML/PDF 导出
-│       ├── github.py         # GitHub SSE 分析
-│       ├── interview.py      # 面试题/自我介绍/弱点
-│       └── sessions.py       # 会话历史
-├── core/                     # 业务逻辑
-│   ├── config.py             # pydantic-settings
-│   ├── database.py           # SQLite 初始化
-│   ├── llm.py                # 统一 LLM 客户端
-│   ├── cache.py              # diskcache
-│   ├── vector_store.py       # ChromaDB
-│   ├── logging_setup.py      # 日志配置
-│   ├── resume/               # 解析、Schema、导出
-│   ├── jd/                   # 解析、匹配、信号检测
-│   ├── interview/            # 题目/自我介绍/弱点
-│   ├── github/               # 分析编排器
-│   └── evaluation/           # ATS 模拟、规则引擎、评分
-├── frontend/                 # Next.js 14
-│   ├── app/
-│   │   ├── page.tsx          # 聊天首页（上传 + 对话）
-│   │   ├── match/page.tsx    # JD 匹配页面
-│   │   └── interview/page.tsx # 面试准备页面
-│   ├── components/
-│   │   ├── chat/             # 聊天面板、消息气泡、推理链
-│   │   ├── resume/           # 简历展示、段落卡片
-│   │   ├── match/            # 匹配报告（评分环）
-│   │   └── layout/           # 侧边栏导航
-│   ├── contexts/             # React Context 状态管理
-│   ├── hooks/                # useSSE、useResume
-│   └── lib/api.ts            # API 客户端
-├── prompts/                  # YAML 提示词模板
-│   ├── agent/                # 系统/规划器/记忆提取
-│   ├── interview/            # 面试/自我介绍
-│   ├── github/               # 建议/简历条目
-│   └── evaluation/           # LLM 评判准则
-├── data/                     # 运行时数据（gitignore）
-├── tests/                    # 测试
-├── .env                      # 环境配置（gitignore）
-├── pyproject.toml
-├── README-EN.md              # 英文文档
-└── README.md                 # 中文文档（本文件）
+├── agent/                    # Agent 核心
+│   ├── loop.py               # P→A→O→R 状态机(轮次语义、幂等重试、降级回复)
+│   ├── context.py            # 每轮重组装的上下文(记忆 + 动态工具门控)
+│   ├── checkpoint.py         # 崩溃恢复检查点(干净结束自动清理)
+│   ├── memory/               # 记忆系统(提取 → 双写 → 检索 → 巩固,全链路可用)
+│   └── tools/                # 33 个工具 + 注册中心(执行时强制前置条件与确认)
+├── api/                      # FastAPI
+│   ├── main.py               # 入口、真实健康检查、全局异常处理
+│   ├── deps.py               # DI 容器(加锁懒初始化、记忆巩固后台任务)
+│   ├── session_manager.py    # 会话持久化(写锁、标题只设一次)
+│   └── routes/               # chat(SSE) / resume / versions / jd / export / github(SSE) / interview / sessions
+├── core/
+│   ├── llm.py                # 统一异步 LLM 客户端 + 共享 JSON/模板/防注入工具函数
+│   ├── config.py             # pydantic-settings(路径可覆盖、锚定项目根)
+│   ├── resume/               # schema / 解析 / 脱敏 / 导出 / 版本管理
+│   ├── jd/                   # 解析 / 匹配 / 信号检测 / 关键词覆盖
+│   ├── interview/            # 问题 / 自我介绍 / 弱点(统一语言检测)
+│   ├── github/               # 克隆 / 结构 / 依赖 / Issue / 建议 / 条目
+│   └── evaluation/           # 渲染 / 规则 / LLM 评审 / ATS / 聚合
+├── frontend/                 # Next.js(聊天 / JD 匹配 / 面试 / GitHub 分析)
+├── tests/                    # pytest 单元测试
+├── .env.example
+└── pyproject.toml
 ```
 
 ---
 
-## 🔐 隐私与安全
-
-- **隐私脱敏中间件** — 手机号、邮箱、社交账号等在发送给 LLM **前**自动掩码，响应后再通过映射还原
-- **本地优先存储** — SQLite + 嵌入式 ChromaDB，数据完全自控
-- **无外部服务依赖** — 不依赖外部数据库或向量数据库服务，仅 LLM API 调用涉及数据传输
-- **可配置 LLM 供应商** — 支持 Anthropic Claude 或 OpenAI 兼容接口
-
----
-
-## 🧪 测试
+## 🧪 测试与开发
 
 ```bash
-pytest
-pytest --cov=agent --cov=core --cov=api
-pytest tests/unit/
-pytest tests/integration/
-```
-
----
-
-## 🧰 开发
-
-```bash
-pip install -e ".[dev]"
-uvicorn api.main:app --reload --host 127.0.0.1 --port 8000   # 后端开发
-cd frontend && npm run dev                                      # 前端开发
-ruff check .                                                     # Python 代码检查
+pytest                    # 运行测试
+ruff check .              # Python 静态检查
+cd frontend && npm run lint && npm run typecheck
 ```
 
 ---
