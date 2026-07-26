@@ -6,6 +6,7 @@ from core.llm import (
     extract_json_str,
     parse_json_response,
     render_prompt,
+    repair_json,
     wrap_untrusted,
 )
 
@@ -54,6 +55,38 @@ class TestParseJsonResponse:
     def test_raises_on_invalid_json(self):
         with pytest.raises(ValueError):
             parse_json_response('{"a": trailing')
+
+
+class TestRepairJson:
+    def test_truncated_mid_string(self):
+        """The JD-parse bug: response cut off inside a string value."""
+        truncated = '{"position_title": "后端工程师", "hard_requirements": [{"criterion": "3年 Java"}, {"criterion": "熟悉被截断的字'
+        result = repair_json(truncated)
+        assert result is not None
+        assert result["position_title"] == "后端工程师"
+        assert result["hard_requirements"][0]["criterion"] == "3年 Java"
+
+    def test_truncated_after_key(self):
+        """Cut right after a key (no value) — must back off to the comma."""
+        result = repair_json('{"a": 1, "b": [2, 3], "c"')
+        assert result == {"a": 1, "b": [2, 3]}
+
+    def test_truncated_nested_array(self):
+        result = repair_json('{"items": [{"x": 1}, {"x": 2}, {"x"')
+        assert result == {"items": [{"x": 1}, {"x": 2}]}
+
+    def test_valid_json_untouched(self):
+        assert repair_json('{"a": 1}') == {"a": 1}
+
+    def test_hopeless_input(self):
+        assert repair_json("not json at all") is None
+        assert repair_json("") is None
+
+    def test_parse_json_response_auto_repairs(self):
+        """parse_json_response must recover instead of raising."""
+        truncated = '```json\n{"signals": [{"phrase": "996"}], "keywords": {"Java": 3, "被截'
+        result = parse_json_response(truncated)
+        assert result["signals"] == [{"phrase": "996"}]
 
 
 class TestRenderPrompt:

@@ -70,8 +70,10 @@ class JDParser:
         )
 
         try:
+            # 4096: a long JD's structured output (requirements + signals +
+            # Chinese keyword table) can exceed 2048 tokens and truncate.
             response = await self.llm.messages.create(
-                max_tokens=2048,
+                max_tokens=4096,
                 temperature=0.0,
                 expect_json=True,
                 system=JD_SYSTEM_PROMPT,

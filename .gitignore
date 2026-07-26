@@ -21,6 +21,11 @@ data/chroma/
 data/cache/
 data/uploads/
 data/logs/
+data/versions/
+data/current_resume.txt
+
+# Test artifacts (screenshots etc.)
+bug image/
 
 # Environment
 .env
@@ -47,6 +52,7 @@ ResumeAgent-PRD.md
 ResumeAgent-Architecture.md
 ResumeAgent-TaskList.md
 ResumeAgent-ChangeSummary.md
+ResumeAgent-ProjectGuide.md
 
 # Claude
 .claude/

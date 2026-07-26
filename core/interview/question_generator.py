@@ -23,6 +23,36 @@ _RESULT_KEYS = (
     "most_likely_questions",
 )
 
+
+def _as_string_list(raw) -> list[str]:
+    """Coerce list items to plain strings; {"question"/"tip": ...} objects unwrap."""
+    if not isinstance(raw, list):
+        return []
+    items = []
+    for it in raw:
+        if isinstance(it, str) and it.strip():
+            items.append(it.strip())
+        elif isinstance(it, dict):
+            text = it.get("question") or it.get("tip") or it.get("text") or ""
+            if isinstance(text, str) and text.strip():
+                items.append(text.strip())
+    return items
+
+
+def _as_question_list(raw) -> list[dict]:
+    """Coerce list items to {"question": ...} dicts; plain strings get wrapped."""
+    if not isinstance(raw, list):
+        return []
+    items = []
+    for it in raw:
+        if isinstance(it, dict):
+            q = it.get("question")
+            if isinstance(q, str) and q.strip():
+                items.append(it)
+        elif isinstance(it, str) and it.strip():
+            items.append({"question": it.strip()})
+    return items
+
 SYSTEM_PROMPT = (
     "You are an experienced technical interviewer. You generate realistic, "
     "targeted interview questions from a candidate's resume and, when "
@@ -159,6 +189,13 @@ class InterviewQuestionGenerator:
         if not has_company:
             # No company info — never fabricate company-specific tips.
             data["company_specific_tips"] = []
+
+        # Normalize shapes — the LLM occasionally wraps plain-string lists in
+        # {"question": ...} objects (and vice versa), which crashes the UI.
+        for key in ("most_likely_questions", "company_specific_tips"):
+            data[key] = _as_string_list(data.get(key))
+        for key in ("star_deep_dives", "technical_follow_ups", "behavioral", "pressure_tests"):
+            data[key] = _as_question_list(data.get(key))
 
         logger.debug(
             "Generated interview questions: %s",

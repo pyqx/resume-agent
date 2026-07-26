@@ -140,8 +140,58 @@ def extract_json_str(text: str) -> str | None:
     return candidate[start:]
 
 
+def repair_json(candidate: str) -> Any | None:
+    """Best-effort repair of truncated/unbalanced LLM JSON.
+
+    Collects string-aware cut points (positions where every open value is
+    complete), then — newest first — truncates there and closes the
+    still-open brackets in true nesting order. Returns the parsed object,
+    or None when no truncation yields valid JSON.
+    """
+    if not candidate:
+        return None
+    cut_points: list[tuple[int, list[str]]] = []
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(candidate):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+                cut_points.append((i + 1, stack.copy()))
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+            cut_points.append((i + 1, stack.copy()))
+        elif ch == ",":
+            cut_points.append((i, stack.copy()))
+
+    closer = {"{": "}", "[": "]"}
+    for cut, open_stack in reversed(cut_points[-40:]):
+        attempt = candidate[:cut].rstrip().rstrip(",")
+        attempt += "".join(closer[c] for c in reversed(open_stack))
+        try:
+            return json.loads(attempt)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def parse_json_response(response_or_text: Any) -> Any:
-    """extract_text -> extract_json_str -> json.loads. Raises ValueError."""
+    """extract_text -> extract_json_str -> json.loads. Raises ValueError.
+
+    Truncated/unbalanced JSON (max_tokens cut-offs, unstable endpoints) gets
+    a best-effort repair before failing; repairs are logged as warnings.
+    """
     text = extract_text(response_or_text)
     candidate = extract_json_str(text)
     if candidate is None:
@@ -149,6 +199,10 @@ def parse_json_response(response_or_text: Any) -> Any:
     try:
         return json.loads(candidate)
     except json.JSONDecodeError as e:
+        repaired = repair_json(candidate)
+        if repaired is not None:
+            logger.warning("LLM JSON repaired after parse failure (%s)", e)
+            return repaired
         raise ValueError(f"Invalid JSON in LLM response: {e}") from e
 
 

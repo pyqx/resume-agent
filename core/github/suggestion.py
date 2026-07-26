@@ -32,6 +32,11 @@ Generate 3-5 improvement directions for this repository. Each direction should b
 2. **Feasible** — based on the repo's actual tech stack and codebase
 3. **Impactful** — valuable to the project and impressive on a resume
 
+LANGUAGE REQUIREMENT (重要): 所有描述性文字必须使用简体中文,包括 title、what_to_do、
+why_valuable、technical_challenges、prerequisite_knowledge、resume_impact、
+learning_path、avoid 的 reason、overall_assessment。技术术语、框架/库名、命令保持
+英文原文(如 Kubernetes、pytest)。difficulty 字段保持英文枚举值不变。
+
 For each direction, provide:
 - title: short name
 - what_to_do: concrete description of the change

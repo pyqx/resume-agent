@@ -104,10 +104,22 @@ function downloadMarkdown(basename: string, content: string) {
   );
 }
 
+/** LLM 输出偶尔把字符串列表包成 {question: "..."} 对象;渲染前统一取文本,
+ *  同时兼容 sessionStorage 里已持久化的旧数据。 */
+function asText(item: unknown): string {
+  if (typeof item === "string") return item;
+  if (item && typeof item === "object") {
+    const obj = item as Record<string, unknown>;
+    const text = obj.question ?? obj.tip ?? obj.text;
+    if (typeof text === "string") return text;
+  }
+  return "";
+}
+
 function questionsToMarkdown(q: InterviewData): string {
   const lines: string[] = ["# 面试问题\n"];
   if (q.most_likely_questions?.length) {
-    lines.push("## 最可能被问到的问题\n", ...q.most_likely_questions.map((s) => `- ${s}`), "");
+    lines.push("## 最可能被问到的问题\n", ...q.most_likely_questions.map((s) => `- ${asText(s)}`), "");
   }
   if (q.star_deep_dives?.length) {
     lines.push("## STAR 深挖追问\n", ...q.star_deep_dives.map((s) => `- ${s.question}${s.dimension ? `(${s.dimension})` : ""}`), "");
@@ -122,7 +134,7 @@ function questionsToMarkdown(q: InterviewData): string {
     lines.push("## 压力测试题\n", ...q.pressure_tests.map((s) => `- ${s.question}`), "");
   }
   if (q.company_specific_tips?.length) {
-    lines.push("## 公司针对性建议\n", ...q.company_specific_tips.map((t) => `- ${t}`), "");
+    lines.push("## 公司针对性建议\n", ...q.company_specific_tips.map((t) => `- ${asText(t)}`), "");
   }
   return lines.join("\n");
 }
@@ -461,7 +473,7 @@ export default function InterviewPage() {
                     <h3 className="font-bold text-red-600 mb-2">最可能被问到的问题</h3>
                     {questions.most_likely_questions.map((q, i) => (
                       <div key={i} className="border-l-4 border-red-500 rounded-r-lg p-3 mb-2 bg-red-50">
-                        <p className="text-sm font-medium">{q}</p>
+                        <p className="text-sm font-medium">{asText(q)}</p>
                       </div>
                     ))}
                   </div>
@@ -477,7 +489,7 @@ export default function InterviewPage() {
                     <h3 className="font-bold text-blue-700 mb-2">公司针对性建议</h3>
                     <ul className="list-disc list-inside text-sm space-y-1">
                       {questions.company_specific_tips.map((tip, i) => (
-                        <li key={i}>{tip}</li>
+                        <li key={i}>{asText(tip)}</li>
                       ))}
                     </ul>
                   </div>

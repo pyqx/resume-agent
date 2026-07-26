@@ -34,9 +34,11 @@ Write a STAR-format resume entry with these sections:
 - **outcomes**: 2-3 bullet points with quantified or specific results
 
 Rules:
-- Use strong action verbs (designed, implemented, optimized, integrated)
+- 所有内容用简体中文撰写(background/role/technical_approach/outcomes);技术名词、
+  框架/库名保持英文原文。entry_title 格式:"开源项目贡献:<项目名> — <贡献方向>"
+- 使用有力的动词(设计、实现、优化、重构、集成),避免"负责/参与"类弱动词
 - Include specific technology names and technical concepts
-- Make results concrete — if user hasn't completed the work yet, use "Expected outcomes:" prefix
+- Make results concrete — 尚未完成的工作,在 outcomes 条目前加"预期成果:"前缀
 - Keep it to 5-8 bullet points total
 - Match the tone of a professional senior-level resume
 
@@ -113,7 +115,7 @@ class ResumeEntryComposer:
             )
 
         result.setdefault("background", "")
-        result.setdefault("role", "Contributor")
+        result.setdefault("role", "独立贡献者")
         result.setdefault("technologies_mentioned", [])
         # is_planned: default True (entries describe planned work unless the LLM
         # marks them completed); normalize to a strict bool for consumers.

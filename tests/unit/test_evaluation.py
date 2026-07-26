@@ -76,6 +76,31 @@ class TestRules:
         assert any(v.rule == "weak_verb" for v in result.violations)
 
 
+class TestFullAuditTool:
+    def test_audit_payload_builds_with_dict_ats_fields(self):
+        """Regression: ats_fields items are dicts (asdict) — payload assembly
+        must not assume legacy attribute objects ('dict' has no attr 'field')."""
+        import asyncio
+        from agent.tools.quality_tools import RunFullQualityAuditTool
+        from core.evaluation.scorer import Scorer
+
+        class FakeJudge:
+            async def evaluate(self, resume):
+                return {"available": False, "error": "offline"}
+
+        resume = _full_resume()
+        tool = RunFullQualityAuditTool(
+            RuleEvaluator(), FakeJudge(), ATSSimulator(), Scorer(),
+            lambda resume_id="": resume,
+        )
+        result = asyncio.run(tool.execute())
+        assert result.success, f"{result.error_code}: {result.error_message}"
+        payload = result.data
+        assert payload["llm_available"] is False
+        assert all("field" in f and "found" in f for f in payload["ats"]["fields"])
+        assert 0 <= payload["overall_score"] <= 10
+
+
 class TestATS:
     def test_full_resume_scores_high_without_saturation(self):
         result = ATSSimulator().simulate(_full_resume())

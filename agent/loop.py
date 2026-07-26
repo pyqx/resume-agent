@@ -56,6 +56,15 @@ If you can respond directly, output:
 Output ONLY valid JSON:"""
 
 
+def _first_text(plan: dict, *keys: str) -> str:
+    """First non-empty string value among the given keys."""
+    for key in keys:
+        value = plan.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 class LoopState(str, Enum):
     PLAN = "plan"
     ACT = "act"
@@ -284,16 +293,25 @@ class AgentLoop:
                 "reasoning": reasoning,
             })
         elif action == "ask":
-            ctx.agent_response = str(plan.get("question") or "能再具体描述一下你的需求吗?")
+            question = _first_text(plan, "question", "message") or "能再具体描述一下你的需求吗?"
+            ctx.agent_response = question
             ctx.state = LoopState.NEED_USER
             ctx.emit_event("plan_decision", {"action": "ask", "question": ctx.agent_response})
         else:  # respond
-            message = plan.get("message")
+            # Models drift on the answer key name ("response"/"answer"/...).
+            message = _first_text(
+                plan, "message", "response", "answer", "reply", "final_answer", "content", "text"
+            )
+            if not message and extract_json_str(content) is None and content.strip():
+                message = content  # plain prose response
             if not message:
-                # Don't show raw JSON fragments to the user.
-                message = content if extract_json_str(content) is None and content.strip() else (
-                    "我暂时没有得到有效回复,请再试一次。"
+                # JSON came back without a usable answer (wrong key shape or
+                # truncated). Ask once for a plain-language answer instead of
+                # giving up with a canned failure message.
+                logger.warning(
+                    "Plan respond had no usable message; raw content: %.300r", content
                 )
+                message = await self._compose_plain_answer(ctx, assembled)
             ctx.agent_response = str(message)
             ctx.state = LoopState.END
             ctx.emit_event("plan_decision", {"action": "respond", "message": ctx.agent_response[:200]})
@@ -479,6 +497,30 @@ class AgentLoop:
             error_code="MAX_RETRIES", error_message="All retries exhausted"
         )
 
+    async def _compose_plain_answer(self, ctx: LoopContext, assembled: dict) -> str:
+        """Last-resort: the plan JSON carried no usable answer — ask the LLM
+        for a plain-language reply built from the tool results."""
+        try:
+            response = await self._llm.messages.create(
+                system=assembled["system_prompt"],
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"用户的问题:{ctx.user_message}\n\n"
+                        f"## 已执行的工具与结果\n{ctx.tool_call_history_summary()}\n\n"
+                        "请基于以上信息,直接用自然语言完整回答用户的问题。"
+                        "不要输出 JSON,不要描述你的处理过程。"
+                    ),
+                }],
+                temperature=0.5,
+            )
+            text = extract_text(response).strip()
+            if text:
+                return text
+        except Exception as e:
+            logger.error("Plain answer composition failed: %s", e)
+        return "抱歉,组织回复时出现问题。分析已完成,请再发送一次问题获取结果。"
+
     async def _save_checkpoint(self, ctx: LoopContext):
         try:
             cp = Checkpoint(
@@ -508,5 +550,10 @@ class AgentLoop:
                 "question": "我暂时没有得到有效回复,请再说一次你的需求。",
                 "reasoning": "Empty LLM response",
             }
+        if extract_json_str(content) is not None:
+            # JSON-ish but unparseable (likely truncated) — leave message
+            # empty so the respond branch composes a plain answer instead of
+            # echoing raw fragments.
+            return {"action": "respond", "reasoning": "Unparseable JSON response"}
         # Non-JSON prose: treat as a direct response.
         return {"action": "respond", "message": content, "reasoning": "Plain-text response"}

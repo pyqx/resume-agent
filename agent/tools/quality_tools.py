@@ -187,6 +187,21 @@ class CheckSensitiveInfoTool(BaseTool):
             return ToolResult.fail("SENSITIVE_CHECK_ERROR", str(e), is_retryable=False)
 
 
+def _ats_field_dict(f) -> dict:
+    """ats_fields items are dicts (new ATS simulator) or legacy objects."""
+    if isinstance(f, dict):
+        return {
+            "field": f.get("field", ""),
+            "found": bool(f.get("found")),
+            "issues": f.get("issues", []),
+        }
+    return {
+        "field": getattr(f, "field", ""),
+        "found": getattr(f, "found", False),
+        "issues": getattr(f, "issues", []),
+    }
+
+
 class RunFullQualityAuditTool(BaseTool):
     def __init__(self, rule_evaluator, llm_judge, ats_simulator, scorer, get_resume_fn):
         self._rules = rule_evaluator
@@ -256,10 +271,7 @@ class RunFullQualityAuditTool(BaseTool):
                 "suggestions": report.suggestions,
                 "strengths": report.strengths,
                 "ats": {
-                    "fields": [
-                        {"field": f.field, "found": f.found, "issues": f.issues}
-                        for f in report.ats_fields
-                    ],
+                    "fields": [_ats_field_dict(f) for f in report.ats_fields],
                     "format_issues": report.ats_format_issues,
                     "keyword_coverage_pct": report.keyword_coverage,
                 },
